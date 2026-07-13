@@ -6,6 +6,7 @@ from introspection_scaling.extract import (
     ConceptVector,
     build_dataset,
     extract_concept_vector,
+    load_extraction_model,
     make_random_matched,
 )
 from introspection_scaling.harness import (
@@ -60,6 +61,7 @@ __all__ = [
     "dose_alpha",
     "extract_concept_vector",
     "layer_for_fraction",
+    "load_extraction_model",
     "make_random_matched",
     "render_prompt",
     "run_concept",
