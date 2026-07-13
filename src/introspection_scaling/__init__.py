@@ -20,6 +20,9 @@ from introspection_scaling.harness import (
     layer_for_fraction,
     run_concept,
     run_conditions,
+    to_seed_records,
+    trial_sampling_seed,
+    write_seed_records,
 )
 
 __version__ = "0.0.1"
@@ -45,4 +48,7 @@ __all__ = [
     "layer_for_fraction",
     "run_concept",
     "run_conditions",
+    "to_seed_records",
+    "trial_sampling_seed",
+    "write_seed_records",
 ]

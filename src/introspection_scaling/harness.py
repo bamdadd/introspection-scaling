@@ -28,7 +28,16 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from introspection_scaling.records import (
+    CONDITION_INJECTED,
+    CONDITION_NO_INJECTION,
+    CONDITION_RANDOM,
+    SeedRecord,
+    write_records,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -120,11 +129,15 @@ def _default_random_matched(cv: ConceptVectorLike, seed: int) -> ConceptVectorLi
 
 
 class Condition(StrEnum):
-    """The three conditions run for every trial, reported side by side."""
+    """The three conditions run for every trial, reported side by side.
 
-    INJECTED = "injected"
-    CONTROL_NONE = "control_none"
-    CONTROL_RANDOM = "control_random"
+    Values are A3's canonical condition strings (``records.py``) so a
+    ``TrialRecord``/``SeedRecord`` round-trips without a mapping layer.
+    """
+
+    INJECTED = CONDITION_INJECTED  # "injected"
+    CONTROL_NONE = CONDITION_NO_INJECTION  # "no_injection"
+    CONTROL_RANDOM = CONDITION_RANDOM  # "random_direction"
 
 
 @dataclass(frozen=True)
@@ -163,6 +176,9 @@ class TrialRecord:
     seed: int
     transcript: str
     verdict: JudgeVerdict
+    # Index within the seed's trial batch (0-based). The exact sampling RNG seed
+    # is ``trial_sampling_seed(seed, trial)`` — reproducible from these two.
+    trial: int = 0
     # Dose provenance (orch-2 norm-relative alpha). None when alpha was passed
     # raw rather than computed from a measured residual norm.
     dose_fraction: float | None = None
@@ -431,6 +447,16 @@ def dose_alpha(
 # --------------------------------------------------------------------------- #
 
 
+def trial_sampling_seed(seed: int, trial: int) -> int:
+    """Distinct, reproducible RNG seed for trial ``trial`` within batch ``seed``.
+
+    Each seed batch runs ``n_trials`` independent temperature-1 samples; they must
+    NOT collapse to one output (the generator re-seeds per call), so we spread the
+    batch seed across trials deterministically.
+    """
+    return seed * 100_003 + trial
+
+
 def run_conditions(
     cv: ConceptVectorLike,
     *,
@@ -439,17 +465,21 @@ def run_conditions(
     layer: int,
     alpha: float,
     seeds: Sequence[int],
+    n_trials: int = 1,
     random_matched_fn: RandomMatchedFn | None = None,
     dose_fraction: float | None = None,
     resid_norm: float | None = None,
 ) -> list[TrialRecord]:
     """Run all three conditions across ``seeds`` for one concept vector.
 
-    ``alpha`` is the injected norm (== ``dose_fraction * resid_norm`` when dosed
-    per orch-2's rule; see ``run_concept``). ``dose_fraction``/``resid_norm`` are
-    recorded on each trial for provenance only. Temperature-1 sampling for the
-    rate measurement lives inside ``generator``; pass >=3 seeds (SPEC).
+    For each ``(seed, condition)`` we run ``n_trials`` temperature-1 samples and
+    emit one :class:`TrialRecord` each (``.seed`` = batch seed, ``.trial`` =
+    0-based index). ``alpha`` is the injected norm (== ``dose_fraction *
+    resid_norm`` when dosed per orch-2; see ``run_concept``); ``dose_fraction``/
+    ``resid_norm`` are recorded for provenance. Pass >=3 seeds (SPEC).
     """
+    if n_trials < 1:
+        raise ValueError(f"n_trials must be >= 1, got {n_trials}")
     if random_matched_fn is None:
         random_matched_fn = _default_random_matched
     records: list[TrialRecord] = []
@@ -461,22 +491,25 @@ def run_conditions(
                 inject = None
             else:  # CONTROL_RANDOM
                 inject = random_matched_fn(cv, seed)
-            response = generator.generate(inject, layer, alpha, seed)
-            verdict = judge.grade(cv.concept, response)
-            records.append(
-                TrialRecord(
-                    model_id=cv.model_id,
-                    concept=cv.concept,
-                    condition=condition,
-                    alpha=alpha,
-                    layer=layer,
-                    seed=seed,
-                    transcript=response,
-                    verdict=verdict,
-                    dose_fraction=dose_fraction,
-                    resid_norm=resid_norm,
+            for trial in range(n_trials):
+                sampling_seed = trial_sampling_seed(seed, trial)
+                response = generator.generate(inject, layer, alpha, sampling_seed)
+                verdict = judge.grade(cv.concept, response)
+                records.append(
+                    TrialRecord(
+                        model_id=cv.model_id,
+                        concept=cv.concept,
+                        condition=condition,
+                        alpha=alpha,
+                        layer=layer,
+                        seed=seed,
+                        trial=trial,
+                        transcript=response,
+                        verdict=verdict,
+                        dose_fraction=dose_fraction,
+                        resid_norm=resid_norm,
+                    )
                 )
-            )
     return records
 
 
@@ -499,6 +532,7 @@ def run_concept(
     generator: DoseGenerator,
     judge: Judge,
     seeds: Sequence[int],
+    n_trials: int = 1,
     depth_fraction: float = DEPTH_FRACTION_DEFAULT,
     dose_fraction: float = DOSE_FRACTION_DEFAULT,
     random_matched_fn: RandomMatchedFn | None = None,
@@ -521,6 +555,7 @@ def run_concept(
         layer=layer,
         alpha=alpha,
         seeds=seeds,
+        n_trials=n_trials,
         random_matched_fn=random_matched_fn,
         dose_fraction=dose_fraction,
         resid_norm=resid_norm,
@@ -544,6 +579,44 @@ def aggregate(records: Sequence[TrialRecord]) -> list[ConditionRate]:
             )
         )
     return rates
+
+
+def to_seed_records(records: Sequence[TrialRecord]) -> list[SeedRecord]:
+    """Collapse per-trial records into A3's :class:`SeedRecord` counts.
+
+    One SeedRecord per ``(model, concept, condition, seed)`` carrying raw
+    ``(n_success, n_trials)`` — rates stay un-precomputed so A3's count-level
+    bootstrap keeps every level of the design. Per A3's schema, ``layer``/
+    ``alpha`` are ``None`` for the no-injection control (nothing was injected).
+    """
+    buckets: dict[tuple[str, str, Condition, int], list[TrialRecord]] = {}
+    for r in records:
+        buckets.setdefault((r.model_id, r.concept, r.condition, r.seed), []).append(r)
+    out: list[SeedRecord] = []
+    for (model_id, concept, condition, seed), rs in buckets.items():
+        injected = condition is not Condition.CONTROL_NONE
+        out.append(
+            SeedRecord(
+                model_id=model_id,
+                concept=concept,
+                condition=str(condition),
+                seed=seed,
+                n_success=sum(r.success for r in rs),
+                n_trials=len(rs),
+                layer=rs[0].layer if injected else None,
+                alpha=rs[0].alpha if injected else None,
+            )
+        )
+    return out
+
+
+def write_seed_records(
+    records: Sequence[TrialRecord], path: str | Path = "results/records.jsonl"
+) -> list[SeedRecord]:
+    """Aggregate trials to SeedRecords and write them as JSONL (A3's format)."""
+    seed_records = to_seed_records(records)
+    write_records(seed_records, path)
+    return seed_records
 
 
 # --------------------------------------------------------------------------- #

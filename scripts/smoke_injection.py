@@ -37,6 +37,7 @@ from introspection_scaling.harness import (  # noqa: E402
     dose_alpha,
     layer_for_fraction,
     run_concept,
+    write_seed_records,
 )
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
@@ -143,6 +144,15 @@ def main() -> None:
     print("\n--- SUCCESS RATES (concept=oceans) ---")
     for cr in sorted(aggregate(records), key=lambda c: c.condition.value):
         print(f"  {cr.condition.value:14} {cr.successes}/{cr.n} = {cr.rate:.2f}")
+
+    # Emit A3's SeedRecord JSONL (results/records.jsonl) for the stats layer.
+    seed_records = write_seed_records(records, "results/records.jsonl")
+    print("\n--- SEED RECORDS -> results/records.jsonl ---")
+    for sr in sorted(seed_records, key=lambda s: (s.condition, s.seed)):
+        print(
+            f"  {sr.condition:16} seed={sr.seed} "
+            f"{sr.n_success}/{sr.n_trials} layer={sr.layer} alpha={sr.alpha}"
+        )
 
 
 if __name__ == "__main__":

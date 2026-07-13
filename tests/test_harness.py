@@ -21,6 +21,16 @@ from introspection_scaling.harness import (
     layer_for_fraction,
     run_concept,
     run_conditions,
+    to_seed_records,
+    trial_sampling_seed,
+    write_seed_records,
+)
+from introspection_scaling.records import (
+    ALL_CONDITIONS,
+    CONDITION_INJECTED,
+    CONDITION_NO_INJECTION,
+    CONDITION_RANDOM,
+    read_records,
 )
 
 # --- fakes for the A1 seam ------------------------------------------------- #
@@ -250,3 +260,89 @@ def test_rule_based_judge_flagged_non_faithful():
     assert v.coherent and v.affirmative and v.correct_identification and v.success
     v2 = RuleBasedJudge().grade("oceans", "No, I detect nothing.")
     assert not v2.success
+
+
+def test_condition_values_are_a3_canonical_strings():
+    # harness Condition must serialize to A3's records.py condition vocabulary
+    assert str(Condition.INJECTED) == CONDITION_INJECTED
+    assert str(Condition.CONTROL_NONE) == CONDITION_NO_INJECTION
+    assert str(Condition.CONTROL_RANDOM) == CONDITION_RANDOM
+    assert {str(c) for c in Condition} == set(ALL_CONDITIONS)
+
+
+def test_trial_sampling_seeds_distinct_within_batch():
+    seeds = {trial_sampling_seed(3, t) for t in range(5)}
+    assert len(seeds) == 5  # no collapse to one sample
+    assert trial_sampling_seed(0, 1) != trial_sampling_seed(1, 0)
+
+
+def test_n_trials_runs_multiple_samples_per_seed():
+    cv = make_cv()
+    gen = ScriptedGenerator(concept=cv.concept)
+    records = run_conditions(
+        cv,
+        generator=gen,
+        judge=RuleBasedJudge(),
+        layer=4,
+        alpha=2.0,
+        seeds=[0, 1],
+        n_trials=4,
+        random_matched_fn=fake_random_matched,
+    )
+    # 2 seeds * 3 conditions * 4 trials
+    assert len(records) == 2 * 3 * 4
+    inj = [r for r in records if r.condition is Condition.INJECTED and r.seed == 0]
+    assert sorted(r.trial for r in inj) == [0, 1, 2, 3]
+
+
+def test_to_seed_records_counts_and_control_provenance():
+    cv = make_cv()
+    records = run_conditions(
+        cv,
+        generator=ScriptedGenerator(concept=cv.concept),
+        judge=RuleBasedJudge(),
+        layer=7,
+        alpha=3.5,
+        seeds=[0, 1, 2],
+        n_trials=5,
+        dose_fraction=0.044,
+        resid_norm=80.0,
+        random_matched_fn=fake_random_matched,
+    )
+    seed_records = to_seed_records(records)
+    # 3 conditions * 3 seeds
+    assert len(seed_records) == 9
+    by_cond = {}
+    for sr in seed_records:
+        by_cond.setdefault(sr.condition, []).append(sr)
+        assert sr.n_trials == 5
+        assert 0 <= sr.n_success <= sr.n_trials
+    inj = by_cond[CONDITION_INJECTED]
+    assert all(sr.n_success == 5 for sr in inj)  # scripted always identifies
+    assert all(sr.layer == 7 and sr.alpha == 3.5 for sr in inj)
+    # no-injection control: layer/alpha are None per A3 schema
+    none = by_cond[CONDITION_NO_INJECTION]
+    assert all(sr.layer is None and sr.alpha is None for sr in none)
+    # random-direction control still carries injection provenance
+    rand = by_cond[CONDITION_RANDOM]
+    assert all(sr.layer == 7 and sr.alpha == 3.5 for sr in rand)
+
+
+def test_write_seed_records_roundtrips_via_a3_reader(tmp_path):
+    cv = make_cv()
+    records = run_conditions(
+        cv,
+        generator=ScriptedGenerator(concept=cv.concept),
+        judge=RuleBasedJudge(),
+        layer=7,
+        alpha=3.5,
+        seeds=[0, 1, 2],
+        n_trials=2,
+        random_matched_fn=fake_random_matched,
+    )
+    path = tmp_path / "results" / "records.jsonl"
+    written = write_seed_records(records, path)
+    # A3's own reader parses what we wrote (schema-compatible, no drift)
+    loaded = read_records(path)
+    assert len(loaded) == len(written) == 9
+    assert {sr.condition for sr in loaded} == set(ALL_CONDITIONS)
