@@ -26,7 +26,8 @@ def _fake_cv(model_id: str, concept: str) -> ConceptVector:
 class _Recorder:
     def __init__(self) -> None:
         self.events: list[str] = []
-        self.run_concept_calls: list[dict] = []
+        self.gen_completion_calls: list[dict] = []
+        self.judge_calls: list[list] = []
         self.loads: list[tuple] = []
         self.gen_calls: list[tuple] = []
         self.written: list = []
@@ -46,9 +47,17 @@ class _Recorder:
         self.events.append(f"gen:{model_id}")
         return f"generator:{model_id}"
 
-    def run_concept(self, cv, **kwargs):
-        self.run_concept_calls.append({"cv": cv, **kwargs})
-        return [f"trial:{cv.model_id}:{cv.concept}"]
+    def gen_completions(self, cv, **kwargs):
+        # GPU phase: return raw completions (strings stand in for Completion objs)
+        self.gen_completion_calls.append({"cv": cv, **kwargs})
+        self.events.append(f"gencompl:{cv.model_id}")
+        return [f"compl:{cv.model_id}:{cv.concept}"]
+
+    def judge(self, completions, **kwargs):
+        # off-GPU phase: runs AFTER the generator is freed
+        self.judge_calls.append(list(completions))
+        self.events.append("judge")
+        return [f"trial:{c.split(':')[1]}:{c.split(':')[2]}" for c in completions]
 
     def write(self, trials, path):
         self.written = list(trials)
@@ -70,7 +79,8 @@ def _run(rec: _Recorder, path: Path, **kw) -> LadderRun:
         judge=object(),  # skip harness judge resolution
         extract_fn=rec.extract,
         make_generator=rec.make_generator,
-        run_concept_fn=rec.run_concept,
+        generate_completions_fn=rec.gen_completions,
+        judge_completions_fn=rec.judge,
         write_seed_records_fn=rec.write,
         load_model_fn=rec.load_model,
         on_model_done=rec.commit,
@@ -78,10 +88,11 @@ def _run(rec: _Recorder, path: Path, **kw) -> LadderRun:
     )
 
 
-def test_run_concept_called_per_model_and_concept(tmp_path: Path) -> None:
+def test_generate_called_per_model_and_concept(tmp_path: Path) -> None:
     rec = _Recorder()
     res = _run(rec, tmp_path / "records.jsonl")
-    assert len(rec.run_concept_calls) == len(_MODELS) * len(_CONCEPTS)
+    assert len(rec.gen_completion_calls) == len(_MODELS) * len(_CONCEPTS)
+    assert len(rec.judge_calls) == len(_MODELS)  # judged once per rung, post-generation
     assert [m for m, _, _ in rec.loads] == _MODELS  # one extraction load per model
     assert res.ran == _MODELS and res.stopped_reason is None
 
@@ -89,12 +100,13 @@ def test_run_concept_called_per_model_and_concept(tmp_path: Path) -> None:
 def test_orch2_injection_params_threaded(tmp_path: Path) -> None:
     rec = _Recorder()
     _run(rec, tmp_path / "records.jsonl")
-    for call in rec.run_concept_calls:
+    for call in rec.gen_completion_calls:
         assert call["depth_fraction"] == pytest.approx(0.61)
         assert call["dose_fraction"] == pytest.approx(0.044)
         assert call["seeds"] == [0, 1, 2]
         assert call["n_trials"] == 5
         assert call["generator"] == f"generator:{call['cv'].model_id}"
+        assert "judge" not in call  # generation phase does NOT judge
 
 
 def test_precision_map_threaded_to_load_and_generator(tmp_path: Path) -> None:
@@ -120,14 +132,24 @@ def test_default_precision_is_float32(tmp_path: Path) -> None:
     assert all(dtype == "float32" and quant is None for _, dtype, quant in rec.loads)
 
 
-def test_two_phase_extract_before_generate(tmp_path: Path) -> None:
+def test_two_phase_extract_generate_then_judge(tmp_path: Path) -> None:
     rec = _Recorder()
     _run(rec, tmp_path / "records.jsonl")
+    # per model: load (extract) -> build generator -> all completions -> judge.
+    # Judging comes AFTER every completion for the rung (GPU freed before judge).
     assert rec.events == [
         "load:Qwen/Qwen2.5-0.5B-Instruct",
         "gen:Qwen/Qwen2.5-0.5B-Instruct",
+        "gencompl:Qwen/Qwen2.5-0.5B-Instruct",
+        "gencompl:Qwen/Qwen2.5-0.5B-Instruct",
+        "gencompl:Qwen/Qwen2.5-0.5B-Instruct",
+        "judge",
         "load:Qwen/Qwen2.5-1.5B-Instruct",
         "gen:Qwen/Qwen2.5-1.5B-Instruct",
+        "gencompl:Qwen/Qwen2.5-1.5B-Instruct",
+        "gencompl:Qwen/Qwen2.5-1.5B-Instruct",
+        "gencompl:Qwen/Qwen2.5-1.5B-Instruct",
+        "judge",
     ]
 
 
@@ -166,7 +188,8 @@ def test_cost_guard_stops_before_breaching_rung(tmp_path: Path) -> None:
         judge=object(),
         extract_fn=rec.extract,
         make_generator=rec.make_generator,
-        run_concept_fn=rec.run_concept,
+        generate_completions_fn=rec.gen_completions,
+        judge_completions_fn=rec.judge,
         write_seed_records_fn=rec.write,
         load_model_fn=loader,
         on_model_done=rec.commit,
