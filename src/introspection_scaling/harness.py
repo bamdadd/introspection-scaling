@@ -203,6 +203,27 @@ class JudgeVerdict:
 
 
 @dataclass(frozen=True)
+class Completion:
+    """A raw generation BEFORE judging — the GPU-phase output.
+
+    Judging it off-GPU (see :func:`judge_completions`) yields a
+    :class:`TrialRecord`. Splitting generation from judging lets the runner free
+    the GPU before the (network-bound) judge pass.
+    """
+
+    model_id: str
+    concept: str
+    condition: Condition
+    alpha: float
+    layer: int
+    seed: int
+    trial: int
+    transcript: str
+    dose_fraction: float | None = None
+    resid_norm: float | None = None
+
+
+@dataclass(frozen=True)
 class TrialRecord:
     """One trial in one condition for one seed."""
 
@@ -354,7 +375,11 @@ class AnthropicJudge:
                 "pass a non-faithful judge (RuleBasedJudge) — never grade "
                 "silently with a fallback."
             )
+        self._api_key = key
         self._client = anthropic.Anthropic(api_key=key)
+
+    def _grader_prompt(self, concept: str, response: str) -> str:
+        return _GRADER_RUBRIC.format(concept=concept, response=response)
 
     def grade(self, concept: str, response: str) -> JudgeVerdict:
         """Grade one response. NEVER raises: an API error or unparseable grader
@@ -362,12 +387,11 @@ class AnthropicJudge:
         cannot crash an (expensive) ladder run — the trial counts as a
         non-success and the denominator is preserved."""
         try:
-            prompt = _GRADER_RUBRIC.format(concept=concept, response=response)
             msg = self._client.messages.create(
                 model=self.model,
                 max_tokens=256,
                 temperature=self.temperature,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": self._grader_prompt(concept, response)}],
             )
             raw = "".join(
                 getattr(block, "text", "") for block in msg.content if block.type == "text"
@@ -375,6 +399,53 @@ class AnthropicJudge:
             return _parse_verdict(raw)
         except Exception as exc:  # noqa: BLE001 - grader must never crash the run
             return _failed_verdict(exc)
+
+    def grade_many(
+        self, items: Sequence[tuple[str, str]], *, concurrency: int = 10
+    ) -> list[JudgeVerdict]:
+        """Grade many ``(concept, response)`` pairs CONCURRENTLY off-GPU.
+
+        Runs the API calls under an ``asyncio`` semaphore capped at
+        ``concurrency`` (default 10). Order is preserved (result[i] grades
+        items[i]). Each grade uses the same never-raises path as :meth:`grade`,
+        so one bad reply yields a ``parse_error`` non-success verdict rather than
+        crashing the batch. Decouples judging from the GPU: generate first, free
+        the GPU, then call this.
+        """
+        import asyncio
+
+        return asyncio.run(self._grade_many_async(items, concurrency))
+
+    async def _grade_many_async(
+        self, items: Sequence[tuple[str, str]], concurrency: int
+    ) -> list[JudgeVerdict]:
+        import asyncio
+
+        import anthropic
+
+        aclient = anthropic.AsyncAnthropic(api_key=self._api_key)
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _one(concept: str, response: str) -> JudgeVerdict:
+            async with sem:
+                try:
+                    msg = await aclient.messages.create(
+                        model=self.model,
+                        max_tokens=256,
+                        temperature=self.temperature,
+                        messages=[
+                            {"role": "user", "content": self._grader_prompt(concept, response)}
+                        ],
+                    )
+                    raw = "".join(getattr(b, "text", "") for b in msg.content if b.type == "text")
+                    return _parse_verdict(raw)
+                except Exception as exc:  # noqa: BLE001 - never crash the batch
+                    return _failed_verdict(exc)
+
+        try:
+            return list(await asyncio.gather(*(_one(c, r) for c, r in items)))
+        finally:
+            await aclient.close()
 
 
 class RuleBasedJudge:
@@ -528,6 +599,101 @@ def trial_sampling_seed(seed: int, trial: int) -> int:
     return seed * 100_003 + trial
 
 
+def generate_completions(
+    cv: ConceptVectorLike,
+    *,
+    generator: ResponseGenerator,
+    layer: int,
+    alpha: float,
+    seeds: Sequence[int],
+    n_trials: int = 1,
+    random_matched_fn: RandomMatchedFn | None = None,
+    dose_fraction: float | None = None,
+    resid_norm: float | None = None,
+) -> list[Completion]:
+    """GPU phase: produce all completions for the three conditions, no judging.
+
+    For each ``(seed, condition)`` produces ``n_trials`` temperature-1 samples.
+    A generator exposing ``generate_batch`` gets one batched call per
+    ``(seed, condition)`` (all ``n_trials`` in one forward, seeded by the batch
+    ``seed``); otherwise we fall back to per-trial ``generate`` calls seeded by
+    ``trial_sampling_seed(seed, trial)``. Either way completions are reproducible
+    from the seeds. Judge the result off-GPU with :func:`judge_completions`.
+    """
+    if n_trials < 1:
+        raise ValueError(f"n_trials must be >= 1, got {n_trials}")
+    if random_matched_fn is None:
+        random_matched_fn = _default_random_matched
+    batch = getattr(generator, "generate_batch", None)
+    completions: list[Completion] = []
+    for seed in seeds:
+        for condition in Condition:
+            if condition is Condition.INJECTED:
+                inject: ConceptVectorLike | None = cv
+            elif condition is Condition.CONTROL_NONE:
+                inject = None
+            else:  # CONTROL_RANDOM
+                inject = random_matched_fn(cv, seed)
+            if batch is not None:
+                texts = batch(inject, layer, alpha, seed, n_trials)
+            else:
+                texts = [
+                    generator.generate(inject, layer, alpha, trial_sampling_seed(seed, trial))
+                    for trial in range(n_trials)
+                ]
+            for trial, text in enumerate(texts):
+                completions.append(
+                    Completion(
+                        model_id=cv.model_id,
+                        concept=cv.concept,
+                        condition=condition,
+                        alpha=alpha,
+                        layer=layer,
+                        seed=seed,
+                        trial=trial,
+                        transcript=text,
+                        dose_fraction=dose_fraction,
+                        resid_norm=resid_norm,
+                    )
+                )
+    return completions
+
+
+def judge_completions(
+    completions: Sequence[Completion], *, judge: Judge, concurrency: int = 10
+) -> list[TrialRecord]:
+    """Off-GPU phase: grade completions into :class:`TrialRecord`s.
+
+    Uses the judge's concurrent ``grade_many`` (bounded by ``concurrency``) when
+    available, else per-item ``grade``. Order is preserved and one bad grade is a
+    ``parse_error`` non-success, never a crash — so this can run after the GPU is
+    freed.
+    """
+    grade_many = getattr(judge, "grade_many", None)
+    if grade_many is not None:
+        verdicts = grade_many(
+            [(c.concept, c.transcript) for c in completions], concurrency=concurrency
+        )
+    else:
+        verdicts = [judge.grade(c.concept, c.transcript) for c in completions]
+    return [
+        TrialRecord(
+            model_id=c.model_id,
+            concept=c.concept,
+            condition=c.condition,
+            alpha=c.alpha,
+            layer=c.layer,
+            seed=c.seed,
+            trial=c.trial,
+            transcript=c.transcript,
+            verdict=v,
+            dose_fraction=c.dose_fraction,
+            resid_norm=c.resid_norm,
+        )
+        for c, v in zip(completions, verdicts, strict=True)
+    ]
+
+
 def run_conditions(
     cv: ConceptVectorLike,
     *,
@@ -541,47 +707,24 @@ def run_conditions(
     dose_fraction: float | None = None,
     resid_norm: float | None = None,
 ) -> list[TrialRecord]:
-    """Run all three conditions across ``seeds`` for one concept vector.
+    """Generate + judge in one call (three conditions × seeds × trials).
 
-    For each ``(seed, condition)`` we run ``n_trials`` temperature-1 samples and
-    emit one :class:`TrialRecord` each (``.seed`` = batch seed, ``.trial`` =
-    0-based index). ``alpha`` is the injected norm (== ``dose_fraction *
-    resid_norm`` when dosed per orch-2; see ``run_concept``); ``dose_fraction``/
-    ``resid_norm`` are recorded for provenance. Pass >=3 seeds (SPEC).
+    Convenience wrapper over :func:`generate_completions` + :func:`judge_completions`
+    for callers that hold the GPU throughout. The ladder runner drives the two
+    phases separately so it can free the GPU before judging.
     """
-    if n_trials < 1:
-        raise ValueError(f"n_trials must be >= 1, got {n_trials}")
-    if random_matched_fn is None:
-        random_matched_fn = _default_random_matched
-    records: list[TrialRecord] = []
-    for seed in seeds:
-        for condition in Condition:
-            if condition is Condition.INJECTED:
-                inject: ConceptVectorLike | None = cv
-            elif condition is Condition.CONTROL_NONE:
-                inject = None
-            else:  # CONTROL_RANDOM
-                inject = random_matched_fn(cv, seed)
-            for trial in range(n_trials):
-                sampling_seed = trial_sampling_seed(seed, trial)
-                response = generator.generate(inject, layer, alpha, sampling_seed)
-                verdict = judge.grade(cv.concept, response)
-                records.append(
-                    TrialRecord(
-                        model_id=cv.model_id,
-                        concept=cv.concept,
-                        condition=condition,
-                        alpha=alpha,
-                        layer=layer,
-                        seed=seed,
-                        trial=trial,
-                        transcript=response,
-                        verdict=verdict,
-                        dose_fraction=dose_fraction,
-                        resid_norm=resid_norm,
-                    )
-                )
-    return records
+    completions = generate_completions(
+        cv,
+        generator=generator,
+        layer=layer,
+        alpha=alpha,
+        seeds=seeds,
+        n_trials=n_trials,
+        random_matched_fn=random_matched_fn,
+        dose_fraction=dose_fraction,
+        resid_norm=resid_norm,
+    )
+    return judge_completions(completions, judge=judge)
 
 
 class DoseGenerator(Protocol):
@@ -597,6 +740,39 @@ class DoseGenerator(Protocol):
     ) -> str: ...
 
 
+def generate_concept_completions(
+    cv: ConceptVectorLike,
+    *,
+    generator: DoseGenerator,
+    seeds: Sequence[int],
+    n_trials: int = 1,
+    depth_fraction: float = DEPTH_FRACTION_DEFAULT,
+    dose_fraction: float = DOSE_FRACTION_DEFAULT,
+    random_matched_fn: RandomMatchedFn | None = None,
+    allow_over_ceiling: bool = False,
+) -> list[Completion]:
+    """GPU phase for one concept: pick layer by depth, dose alpha by measured
+    residual norm (orch-2), then generate all completions (no judging).
+
+    The runner calls this for every concept, frees the GPU, then judges the
+    pooled completions off-GPU with :func:`judge_completions`.
+    """
+    layer = layer_for_fraction(generator.n_layers, depth_fraction)
+    resid_norm = generator.measure_resid_norm(layer)
+    alpha = dose_alpha(resid_norm, dose_fraction, allow_over_ceiling=allow_over_ceiling)
+    return generate_completions(
+        cv,
+        generator=generator,
+        layer=layer,
+        alpha=alpha,
+        seeds=seeds,
+        n_trials=n_trials,
+        random_matched_fn=random_matched_fn,
+        dose_fraction=dose_fraction,
+        resid_norm=resid_norm,
+    )
+
+
 def run_concept(
     cv: ConceptVectorLike,
     *,
@@ -609,28 +785,23 @@ def run_concept(
     random_matched_fn: RandomMatchedFn | None = None,
     allow_over_ceiling: bool = False,
 ) -> list[TrialRecord]:
-    """End-to-end for one concept: pick layer by depth, dose alpha by measured
-    residual norm (orch-2), then run all three conditions.
+    """End-to-end for one concept: generate (GPU) then judge, in one call.
 
-    This is the norm-relative entry point — alpha is NEVER a raw constant here.
-    ``depth_fraction`` default 0.61 (measured max-effect layer, orch-2's corrected
-    per-layer sweep; see ``DEPTH_FRACTION_DEFAULT``).
+    Convenience wrapper over :func:`generate_concept_completions` +
+    :func:`judge_completions`. ``depth_fraction`` default 0.61 (orch-2). The
+    runner drives the two phases separately to free the GPU before judging.
     """
-    layer = layer_for_fraction(generator.n_layers, depth_fraction)
-    resid_norm = generator.measure_resid_norm(layer)
-    alpha = dose_alpha(resid_norm, dose_fraction, allow_over_ceiling=allow_over_ceiling)
-    return run_conditions(
+    completions = generate_concept_completions(
         cv,
         generator=generator,
-        judge=judge,
-        layer=layer,
-        alpha=alpha,
         seeds=seeds,
         n_trials=n_trials,
-        random_matched_fn=random_matched_fn,
+        depth_fraction=depth_fraction,
         dose_fraction=dose_fraction,
-        resid_norm=resid_norm,
+        random_matched_fn=random_matched_fn,
+        allow_over_ceiling=allow_over_ceiling,
     )
+    return judge_completions(completions, judge=judge)
 
 
 def aggregate(records: Sequence[TrialRecord]) -> list[ConditionRate]:
@@ -785,10 +956,16 @@ class RepengGenerator:
         max_new_tokens: int = 200,
         temperature: float = 1.0,
         inject_span: str = "full",
+        use_cache: bool = True,
     ) -> None:
         """``dtype`` and ``quant`` are the shared ladder contract (match A1/A3):
         ``dtype`` in {float32, float16, bfloat16}; ``quant`` is None or ``'nf4'``
         (bitsandbytes 4-bit). NF4 uses ``device_map='auto'`` and needs a CUDA GPU.
+
+        ``use_cache`` (default True) passes KV-cache through to ``generate``.
+        Without it every step reprocesses the whole sequence — O(n^2) decoding
+        that turns a 200-token generation into a hang. Keep it True in production;
+        the flag exists only so the throughput smoke can measure the difference.
         """
         import torch
         from repeng import ControlModel  # type: ignore[import-untyped]
@@ -796,6 +973,7 @@ class RepengGenerator:
 
         self.model_id = model_id
         self.device = device
+        self.use_cache = use_cache
         self.dtype = dtype
         self.quant = quant
         self.max_new_tokens = max_new_tokens
@@ -855,6 +1033,15 @@ class RepengGenerator:
         directions = {lid: (v_unit if lid == layer else zeros) for lid in self._model.layer_ids}
         return ControlVector(model_type=self._model.config.model_type, directions=directions)
 
+    @staticmethod
+    def _trim(text: str) -> str:
+        # Trim at the next turn boundary if the model keeps rambling.
+        for stop in ("\nHuman:", "\nAssistant:", "\nTrial"):
+            idx = text.find(stop)
+            if idx != -1:
+                text = text[:idx]
+        return str(text).strip()
+
     def generate(
         self,
         inject: ConceptVectorLike | None,
@@ -862,6 +1049,27 @@ class RepengGenerator:
         alpha: float,
         seed: int,
     ) -> str:
+        """One completion. Equivalent to ``generate_batch(..., n=1)[0]`` — same
+        per-seed determinism as before."""
+        return self.generate_batch(inject, layer, alpha, seed, 1)[0]
+
+    def generate_batch(
+        self,
+        inject: ConceptVectorLike | None,
+        layer: int,
+        alpha: float,
+        seed: int,
+        n: int,
+    ) -> list[str]:
+        """Sample ``n`` completions in ONE forward (``num_return_sequences=n``),
+        seeded once by ``seed`` — cuts the per-trial serial-generation cost.
+
+        Injection is identical across the batch (same condition/seed), so a single
+        ``set_control`` covers all ``n``. Sampling stays temperature-1 with
+        ``top_p=1, top_k=0``; the batch is reproducible given ``seed``.
+        """
+        if n < 1:
+            raise ValueError(f"n must be >= 1, got {n}")
         torch = self._torch
         self._model.reset()
         if inject is not None:
@@ -882,18 +1090,19 @@ class RepengGenerator:
                 # temperature-1 the SPEC requires. Override explicitly.
                 top_p=1.0,
                 top_k=0,
+                num_return_sequences=n,
+                # KV-cache ON: without it repeng's per-layer forwards reprocess the
+                # whole sequence every step (O(n^2)) -> the 200-token hang.
+                use_cache=self.use_cache,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
-            new_tokens = out[0, enc["input_ids"].shape[1] :]
-            text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            plen = enc["input_ids"].shape[1]
+            texts = [
+                self.tokenizer.decode(out[i, plen:], skip_special_tokens=True) for i in range(n)
+            ]
         finally:
             self._model.reset()
-        # Trim at the next turn boundary if the base model keeps rambling.
-        for stop in ("\nHuman:", "\nAssistant:", "\nTrial"):
-            idx = text.find(stop)
-            if idx != -1:
-                text = text[:idx]
-        return str(text).strip()
+        return [self._trim(t) for t in texts]
 
     def verify_injection_delta(
         self, inject: ConceptVectorLike, layer: int, alpha: float, *, tol: float = 1e-4

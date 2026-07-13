@@ -44,7 +44,8 @@ from .harness import (
     MissingJudgeCredentialsError,
     RepengGenerator,
     RuleBasedJudge,
-    run_concept,
+    generate_concept_completions,
+    judge_completions,
     write_seed_records,
 )
 from .records import SeedRecord
@@ -87,7 +88,8 @@ class JudgeLike(Protocol):
 # Injected collaborators (defaults are the real A1/A2 callables).
 # GeneratorFactory takes (model_id, dtype, quant) so precision is per model.
 GeneratorFactory = Callable[[str, str, "str | None"], DoseGeneratorLike]
-RunConceptFn = Callable[..., Any]
+GenerateCompletionsFn = Callable[..., list[Any]]  # GPU phase -> Completions
+JudgeCompletionsFn = Callable[..., list[Any]]  # off-GPU phase -> TrialRecords
 WriteFn = Callable[..., list[SeedRecord]]
 ExtractFn = Callable[..., ConceptVector]
 
@@ -219,7 +221,8 @@ def run_ladder(
     # Injected seams — defaults are the real A1/A2 callables (see module docstring).
     extract_fn: ExtractFn = extract_concept_vector,
     make_generator: GeneratorFactory | None = None,
-    run_concept_fn: RunConceptFn = run_concept,
+    generate_completions_fn: GenerateCompletionsFn = generate_concept_completions,
+    judge_completions_fn: JudgeCompletionsFn = judge_completions,
     write_seed_records_fn: WriteFn = write_seed_records,
     random_matched_fn: Callable[[ConceptVector, int], ConceptVector] = make_random_matched,
     load_model_fn: Callable[..., tuple[Any, Any]] = _load_causal_lm,
@@ -242,7 +245,8 @@ def run_ladder(
 
     gen_factory: GeneratorFactory = make_generator if make_generator is not None else _default_gen
     resolved_judge = _resolve_judge(judge, allow_rule_based=allow_rule_based_judge)
-    rc_fn = run_concept_fn
+    gen_fn = generate_completions_fn
+    judge_fn = judge_completions_fn
     write_fn = write_seed_records_fn
     prec = precision_map or {}
     rung_h = rung_gpu_hours or {}
@@ -283,14 +287,15 @@ def run_ladder(
         del model, tokenizer
         _free_cuda()
 
-        # Phase 2: inject + sample + judge per concept (fresh ControlModel).
+        # Phase 2a (GPU): inject + sample all completions per concept, then FREE
+        # the GPU before any (network-bound) judging.
         generator = gen_factory(model_id, dtype, quant)
+        completions: list[Any] = []
         for cv in concept_vectors:
-            all_trials.extend(
-                rc_fn(
+            completions.extend(
+                gen_fn(
                     cv,
                     generator=generator,
-                    judge=resolved_judge,
                     seeds=seeds,
                     n_trials=n_trials,
                     depth_fraction=depth_fraction,
@@ -300,6 +305,9 @@ def run_ladder(
             )
         del generator
         _free_cuda()
+
+        # Phase 2b (off-GPU): grade the completions concurrently — no GPU held.
+        all_trials.extend(judge_fn(completions, judge=resolved_judge))
         ran.append(model_id)
 
         # Incremental write + commit so a later stop/crash keeps this rung.
