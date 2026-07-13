@@ -278,7 +278,7 @@ class AnthropicJudge:
         self.model = model
         self.temperature = temperature
         try:
-            import anthropic  # type: ignore[import-not-found]
+            import anthropic
         except ImportError as exc:
             raise MissingJudgeCredentialsError(
                 "AnthropicJudge needs the 'anthropic' package (request it from "
@@ -302,7 +302,9 @@ class AnthropicJudge:
             temperature=self.temperature,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = "".join(block.text for block in msg.content if getattr(block, "type", None) == "text")
+        raw = "".join(
+            getattr(block, "text", "") for block in msg.content if block.type == "text"
+        )
         return _parse_verdict(raw)
 
 
@@ -533,9 +535,14 @@ class RepengGenerator:
         self.n_layers = n_layers
 
     def _control_vector(self, v_unit: _FloatArray, layer: int) -> Any:
+        import numpy as np
         from repeng import ControlVector
 
-        return ControlVector(model_type=self._model.config.model_type, directions={layer: v_unit})
+        # repeng's set_control requires a direction for EVERY wrapped layer_id;
+        # zero-pad the others so only `layer` is actually injected (0*coeff = 0).
+        zeros = np.zeros_like(v_unit)
+        directions = {lid: (v_unit if lid == layer else zeros) for lid in self._model.layer_ids}
+        return ControlVector(model_type=self._model.config.model_type, directions=directions)
 
     def generate(
         self,
@@ -572,16 +579,24 @@ class RepengGenerator:
         return str(text).strip()
 
     def verify_injection_delta(
-        self, inject: ConceptVectorLike, layer: int, alpha: float
+        self, inject: ConceptVectorLike, layer: int, alpha: float, *, tol: float = 1e-4
     ) -> dict[str, float]:
-        """Empirically confirm repeng applies ``h += alpha * v_unit`` unscaled.
+        """Empirically confirm repeng applies ``h += alpha * v_unit`` UNSCALED.
 
-        Compares the residual at the injected layer with control off vs on and
-        reports the cosine to ``v_unit`` and the magnitude ratio vs ``alpha``.
-        A cosine ~1.0 and ratio ~1.0 confirm the injection contract; deviation
-        means repeng renormalises and alpha does not mean the paper's strength.
-        Run once per (model, repeng version). hidden_states[layer+1] = output of
-        block ``layer``.
+        The load-bearing check is ``magnitude_ratio`` (= |delta| / alpha at the
+        injection site): a value ~1.0 proves repeng does NOT renormalise, so
+        ``alpha`` means the paper's strength. If repeng rescaled the residual,
+        the ratio would drift from 1.0.
+
+        Rather than assume a fixed residual index, we scan ``output_hidden_states``
+        and report the FIRST index whose residual moves — repeng's control lands
+        at ``hidden_states[repeng_layer_id + 2]`` in the transformers version we
+        pin (an output_hidden_states recording artifact), and hardcoding the
+        index silently breaks across versions. ``cosine_to_v_unit`` at that index
+        is informational only: it is one block downstream of the injection, so
+        it is <1.0 by construction (the block transforms the injected component).
+
+        Run once per (model, repeng version).
         """
         import numpy as np
         import torch
@@ -590,24 +605,34 @@ class RepengGenerator:
         prompt = build_prompt()
         enc = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
-        def _resid() -> _FloatArray:
+        def _all_resid() -> list[_FloatArray]:
             with torch.no_grad():
                 out = self._model(**enc, output_hidden_states=True)
-            hs = out.hidden_states[layer + 1][0, -1]
-            return np.asarray(hs.to(torch.float32).cpu().numpy(), dtype=np.float64)
+            return [
+                np.asarray(hs[0, -1].to(torch.float32).cpu().numpy(), dtype=np.float64)
+                for hs in out.hidden_states
+            ]
 
         self._model.reset()
-        off = _resid()
+        off = _all_resid()
         self._model.set_control(self._control_vector(v_unit, layer), alpha)
         try:
-            on = _resid()
+            on = _all_resid()
         finally:
             self._model.reset()
 
-        delta = on - off
-        delta_norm = float(np.linalg.norm(delta))
-        cos = float(delta @ v_unit / (delta_norm + 1e-12))
+        first_idx = -1
+        delta_norm = 0.0
+        cos = 0.0
+        for i, (a, b) in enumerate(zip(off, on, strict=True)):
+            d = b - a
+            dn = float(np.linalg.norm(d))
+            if dn > tol:
+                first_idx, delta_norm = i, dn
+                cos = float(d @ v_unit / dn)
+                break
         return {
+            "first_changed_index": float(first_idx),
             "delta_norm": delta_norm,
             "expected_norm": float(alpha),
             "magnitude_ratio": delta_norm / (abs(alpha) + 1e-12),
