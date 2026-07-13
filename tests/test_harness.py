@@ -176,6 +176,32 @@ def test_dose_alpha_refuses_coherence_cliff():
         dose_alpha(100.0, 0.0)
 
 
+def test_positive_control_success_rule_invariant():
+    """Ceiling-reachable invariant (mirrors scripts/positive_control.py) without
+    the API: only coherent AND correct-identification scores a success; the three
+    failure modes are each withheld. Locks the precondition that makes a
+    small-model null a real finding, not a silent instrument failure."""
+    true_positive = JudgeVerdict(
+        coherent=True, affirmative=True, detects_before_naming=True, correct_identification=True
+    )
+    wrong_concept = JudgeVerdict(  # affirmative but names the wrong concept
+        coherent=True, affirmative=True, detects_before_naming=True, correct_identification=False
+    )
+    negative = JudgeVerdict(  # no detection at all
+        coherent=True, affirmative=False, detects_before_naming=False, correct_identification=False
+    )
+    garbled = JudgeVerdict(  # broken text (fails criterion 1)
+        coherent=False, affirmative=False, detects_before_naming=False, correct_identification=False
+    )
+    # ceiling reachable, and each failure mode fails for the right reason
+    assert [v.success for v in (true_positive, wrong_concept, negative, garbled)] == [
+        True,
+        False,  # criterion 4: wrong concept
+        False,  # criterion 2 -> no correct identification
+        False,  # criterion 1: not coherent
+    ]
+
+
 def test_success_rule_is_coherent_and_correct_id():
     # criterion 1 AND criterion 4 only
     assert JudgeVerdict(True, True, True, True).success
