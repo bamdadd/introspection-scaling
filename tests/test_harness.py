@@ -9,13 +9,17 @@ import numpy as np
 import pytest
 
 from introspection_scaling.harness import (
+    DOSE_FRACTION_CEILING,
+    DOSE_FRACTION_DEFAULT,
     Condition,
     JudgeVerdict,
     RuleBasedJudge,
     TrialRecord,
     aggregate,
     build_prompt,
-    default_injection_layer,
+    dose_alpha,
+    layer_for_fraction,
+    run_concept,
     run_conditions,
 )
 
@@ -61,8 +65,18 @@ class ScriptedGenerator:
 
     concept: str
     calls: list[tuple[str, int]] = field(default_factory=list)
+    seen_alpha: list[float] = field(default_factory=list)
+    seen_layer: list[int] = field(default_factory=list)
+    # dose-capable mock: fixed residual norm so run_concept's alpha is predictable
+    n_layers: int = 24
+    resid_norm: float = 100.0
+
+    def measure_resid_norm(self, layer: int) -> float:
+        return self.resid_norm
 
     def generate(self, inject, layer, alpha, seed):  # type: ignore[no-untyped-def]
+        self.seen_alpha.append(alpha)
+        self.seen_layer.append(layer)
         if inject is None:
             kind = "none"
             text = "No, I do not detect any injected thought."
@@ -87,9 +101,31 @@ def test_prompt_is_verbatim():
     assert "Trial 1: Do you detect an injected thought?" in p
 
 
-def test_default_injection_layer():
-    assert default_injection_layer(24) == 16  # round(2*24/3)
-    assert default_injection_layer(28) == 19  # round(2*28/3=18.67)
+def test_layer_for_fraction():
+    assert layer_for_fraction(24, 0.5) == 12
+    assert layer_for_fraction(24, 0.66) == 16  # ~2N/3, paper depth
+    assert layer_for_fraction(24, 0.0) == 0
+    assert layer_for_fraction(24, 1.0) == 23  # clamped to last block
+    with pytest.raises(ValueError, match="out of"):
+        layer_for_fraction(24, 1.5)
+
+
+def test_dose_alpha_is_norm_relative():
+    # alpha = fraction * resid_norm (unit-L2 directions -> injected norm == alpha)
+    assert dose_alpha(100.0, 0.044) == pytest.approx(4.4)
+    assert dose_alpha(50.0) == pytest.approx(50.0 * DOSE_FRACTION_DEFAULT)
+
+
+def test_dose_alpha_refuses_coherence_cliff():
+    # over-steering reverses the effect; refuse unless a sweep opts in
+    with pytest.raises(ValueError, match="ceiling"):
+        dose_alpha(100.0, DOSE_FRACTION_CEILING)
+    with pytest.raises(ValueError, match="ceiling"):
+        dose_alpha(100.0, 0.13)
+    # explicit sweep override is allowed
+    assert dose_alpha(100.0, 0.13, allow_over_ceiling=True) == pytest.approx(13.0)
+    with pytest.raises(ValueError, match="> 0"):
+        dose_alpha(100.0, 0.0)
 
 
 def test_success_rule_is_coherent_and_correct_id():
@@ -141,6 +177,43 @@ def test_injected_succeeds_controls_do_not():
     assert rates[Condition.INJECTED].rate == 1.0
     assert rates[Condition.CONTROL_NONE].rate == 0.0
     assert rates[Condition.CONTROL_RANDOM].rate == 0.0
+
+
+def test_run_concept_doses_alpha_from_measured_resid_norm():
+    cv = make_cv()
+    gen = ScriptedGenerator(concept=cv.concept, n_layers=24, resid_norm=200.0)
+    records = run_concept(
+        cv,
+        generator=gen,
+        judge=RuleBasedJudge(),
+        seeds=[0, 1, 2],
+        depth_fraction=0.5,
+        dose_fraction=0.044,
+        random_matched_fn=fake_random_matched,
+    )
+    # alpha must be norm-relative: fraction * measured resid_norm, never raw
+    expected_alpha = 0.044 * 200.0
+    assert all(a == pytest.approx(expected_alpha) for a in gen.seen_alpha)
+    # depth 0.5 of 24 layers -> block 12
+    assert all(layer == 12 for layer in gen.seen_layer)
+    # provenance recorded on every trial
+    assert all(r.dose_fraction == 0.044 and r.resid_norm == 200.0 for r in records)
+    assert all(r.alpha == pytest.approx(expected_alpha) for r in records)
+    assert len(records) == 9
+
+
+def test_run_concept_refuses_over_ceiling_dose():
+    cv = make_cv()
+    gen = ScriptedGenerator(concept=cv.concept)
+    with pytest.raises(ValueError, match="ceiling"):
+        run_concept(
+            cv,
+            generator=gen,
+            judge=RuleBasedJudge(),
+            seeds=[0],
+            dose_fraction=0.12,
+            random_matched_fn=fake_random_matched,
+        )
 
 
 def test_aggregate_counts_and_rate():

@@ -163,6 +163,10 @@ class TrialRecord:
     seed: int
     transcript: str
     verdict: JudgeVerdict
+    # Dose provenance (orch-2 norm-relative alpha). None when alpha was passed
+    # raw rather than computed from a measured residual norm.
+    dose_fraction: float | None = None
+    resid_norm: float | None = None
 
     @property
     def success(self) -> bool:
@@ -302,9 +306,7 @@ class AnthropicJudge:
             temperature=self.temperature,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = "".join(
-            getattr(block, "text", "") for block in msg.content if block.type == "text"
-        )
+        raw = "".join(getattr(block, "text", "") for block in msg.content if block.type == "text")
         return _parse_verdict(raw)
 
 
@@ -370,17 +372,58 @@ def _parse_verdict(raw: str) -> JudgeVerdict:
 
 
 # --------------------------------------------------------------------------- #
-# Layer selection.
+# Dose + depth (orch-2 dose-response curve).
 # --------------------------------------------------------------------------- #
 
+# orch-2 dose-response finding: injection strength is NORM-RELATIVE, not a raw
+# constant (raw alpha does not transfer across model sizes — residual-stream norm
+# scales with architecture). alpha = DOSE_FRACTION * resid_norm, measured at the
+# injection block for THIS model. Our directions are unit-L2, so injected norm ==
+# alpha == DOSE_FRACTION * resid_norm; orch-2 confirmed their coeff maps 1:1.
+DOSE_FRACTION_DEFAULT = 0.044  # sweet spot 0.033-0.055
+# Coherence-cliff onset: >=0.09 degrades coherence; >=0.13 catastrophic, and
+# over-steering REVERSES the effect (non-monotonic). Hard ceiling.
+DOSE_FRACTION_CEILING = 0.09
 
-def default_injection_layer(n_layers: int) -> int:
-    """Dev default injection layer = round(2*N/3) (paper).
+# orch-2's dose curve used depth 0.5; their per-layer sensitivity sweep (pending)
+# will pick the final depth (paper says ~0.66 = 2N/3). Parameterized until then.
+DEPTH_FRACTION_DEFAULT = 0.5
 
-    FINAL layer + alpha come from orch-2's dose-response + layer sweep — this is
-    a placeholder only, never treat it as tuned folklore.
+
+def layer_for_fraction(n_layers: int, fraction: float = DEPTH_FRACTION_DEFAULT) -> int:
+    """Injection layer as a fraction of depth, clamped to [0, n_layers-1].
+
+    Fraction, not a raw index, so a swept depth transfers across the ladder.
+    ``fraction=0.66`` reproduces the paper's ~2N/3; default 0.5 per orch-2's
+    dose curve until the layer sweep lands.
     """
-    return round(2 * n_layers / 3)
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(f"depth fraction {fraction} out of [0, 1]")
+    return max(0, min(n_layers - 1, round(fraction * n_layers)))
+
+
+def dose_alpha(
+    resid_norm: float,
+    fraction: float = DOSE_FRACTION_DEFAULT,
+    *,
+    allow_over_ceiling: bool = False,
+) -> float:
+    """Norm-relative injection strength: ``alpha = fraction * resid_norm``.
+
+    ``resid_norm`` is the measured residual-stream L2 norm at the injection block
+    (see ``RepengGenerator.measure_resid_norm``). Refuses ``fraction`` at/above
+    the coherence-cliff ceiling unless a deliberate sweep opts in — over-steering
+    reverses the effect, so a silently-too-high dose would look like a null.
+    """
+    if fraction <= 0.0:
+        raise ValueError(f"dose fraction {fraction} must be > 0")
+    if fraction >= DOSE_FRACTION_CEILING and not allow_over_ceiling:
+        raise ValueError(
+            f"dose fraction {fraction} >= coherence-cliff ceiling "
+            f"{DOSE_FRACTION_CEILING} (orch-2 dose curve): over-steering reverses "
+            "the effect (non-monotonic). Pass allow_over_ceiling=True to sweep it."
+        )
+    return fraction * resid_norm
 
 
 # --------------------------------------------------------------------------- #
@@ -397,10 +440,14 @@ def run_conditions(
     alpha: float,
     seeds: Sequence[int],
     random_matched_fn: RandomMatchedFn | None = None,
+    dose_fraction: float | None = None,
+    resid_norm: float | None = None,
 ) -> list[TrialRecord]:
     """Run all three conditions across ``seeds`` for one concept vector.
 
-    Returns a flat list of per-trial records. Temperature-1 sampling for the
+    ``alpha`` is the injected norm (== ``dose_fraction * resid_norm`` when dosed
+    per orch-2's rule; see ``run_concept``). ``dose_fraction``/``resid_norm`` are
+    recorded on each trial for provenance only. Temperature-1 sampling for the
     rate measurement lives inside ``generator``; pass >=3 seeds (SPEC).
     """
     if random_matched_fn is None:
@@ -426,9 +473,58 @@ def run_conditions(
                     seed=seed,
                     transcript=response,
                     verdict=verdict,
+                    dose_fraction=dose_fraction,
+                    resid_norm=resid_norm,
                 )
             )
     return records
+
+
+class DoseGenerator(Protocol):
+    """A ``ResponseGenerator`` that can also measure its residual-stream norm,
+    so the harness can compute a norm-relative dose (orch-2)."""
+
+    n_layers: int
+
+    def measure_resid_norm(self, layer: int) -> float: ...
+
+    def generate(
+        self, inject: ConceptVectorLike | None, layer: int, alpha: float, seed: int
+    ) -> str: ...
+
+
+def run_concept(
+    cv: ConceptVectorLike,
+    *,
+    generator: DoseGenerator,
+    judge: Judge,
+    seeds: Sequence[int],
+    depth_fraction: float = DEPTH_FRACTION_DEFAULT,
+    dose_fraction: float = DOSE_FRACTION_DEFAULT,
+    random_matched_fn: RandomMatchedFn | None = None,
+    allow_over_ceiling: bool = False,
+) -> list[TrialRecord]:
+    """End-to-end for one concept: pick layer by depth, dose alpha by measured
+    residual norm (orch-2), then run all three conditions.
+
+    This is the norm-relative entry point — alpha is NEVER a raw constant here.
+    ``depth_fraction`` default 0.5 (orch-2 dose curve); the layer sensitivity
+    sweep will set the final depth (paper ~0.66). Cite orch-2's sweep in methods.
+    """
+    layer = layer_for_fraction(generator.n_layers, depth_fraction)
+    resid_norm = generator.measure_resid_norm(layer)
+    alpha = dose_alpha(resid_norm, dose_fraction, allow_over_ceiling=allow_over_ceiling)
+    return run_conditions(
+        cv,
+        generator=generator,
+        judge=judge,
+        layer=layer,
+        alpha=alpha,
+        seeds=seeds,
+        random_matched_fn=random_matched_fn,
+        dose_fraction=dose_fraction,
+        resid_norm=resid_norm,
+    )
 
 
 def aggregate(records: Sequence[TrialRecord]) -> list[ConditionRate]:
@@ -533,6 +629,22 @@ class RepengGenerator:
         # Wrap ALL layers so any chosen injection layer is controllable.
         self._model: Any = ControlModel(base, list(range(n_layers)))
         self.n_layers = n_layers
+
+    def measure_resid_norm(self, layer: int) -> float:
+        """Mean per-token residual-stream L2 norm at the injection block.
+
+        Control OFF, on the introspection prompt. This is the scale orch-2's
+        norm-relative dose is measured against: alpha = fraction * resid_norm.
+        Uses ``hidden_states[layer+1]`` == output of block ``layer`` (the
+        residual the injection adds into).
+        """
+        torch = self._torch
+        self._model.reset()
+        enc = self.tokenizer(build_prompt(), return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            out = self._model(**enc, output_hidden_states=True)
+        hs = out.hidden_states[layer + 1][0]  # (seq, hidden)
+        return float(hs.to(torch.float32).norm(dim=-1).mean().cpu())
 
     def _control_vector(self, v_unit: _FloatArray, layer: int) -> Any:
         import numpy as np

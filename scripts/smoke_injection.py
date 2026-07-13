@@ -29,12 +29,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, "src")
 from introspection_scaling.harness import (  # noqa: E402
+    DOSE_FRACTION_DEFAULT,
     AnthropicJudge,
     RepengGenerator,
     RuleBasedJudge,
     aggregate,
-    default_injection_layer,
-    run_conditions,
+    dose_alpha,
+    layer_for_fraction,
+    run_concept,
 )
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
@@ -93,12 +95,18 @@ def local_random_matched(cv: CV, seed: int) -> CV:
 
 def main() -> None:
     cv = diff_of_means_cv()
-    n_layers = len(cv.directions)
-    layer = default_injection_layer(n_layers)
-    alpha = 8.0  # dev; 0.5B needs stronger push than the paper's alpha=2 default
-    print(f"model={MODEL_ID} n_layers={n_layers} inject_layer={layer} alpha={alpha}")
-
     gen = RepengGenerator(MODEL_ID, max_new_tokens=120, temperature=1.0)
+
+    # orch-2: norm-relative dose. Layer by depth fraction, alpha = fraction*|resid|.
+    depth_fraction = 0.5
+    layer = layer_for_fraction(gen.n_layers, depth_fraction)
+    resid_norm = gen.measure_resid_norm(layer)
+    alpha = dose_alpha(resid_norm, DOSE_FRACTION_DEFAULT)
+    print(
+        f"model={MODEL_ID} n_layers={gen.n_layers} depth={depth_fraction} "
+        f"layer={layer} resid_norm={resid_norm:.2f} "
+        f"dose_fraction={DOSE_FRACTION_DEFAULT} alpha={alpha:.3f}"
+    )
 
     # CRITICAL (advisor #2): confirm repeng applies h += alpha*v_unit unscaled.
     diag = gen.verify_injection_delta(cv, layer, alpha)
@@ -111,13 +119,13 @@ def main() -> None:
         print(f"AnthropicJudge unavailable ({e}); using RuleBasedJudge (NON-FAITHFUL)")
         judge = RuleBasedJudge()
 
-    records = run_conditions(
+    records = run_concept(
         cv,
         generator=gen,
         judge=judge,
-        layer=layer,
-        alpha=alpha,
         seeds=[0, 1, 2],
+        depth_fraction=depth_fraction,
+        dose_fraction=DOSE_FRACTION_DEFAULT,
         random_matched_fn=local_random_matched,
     )
 
