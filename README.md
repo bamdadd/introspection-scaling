@@ -51,6 +51,8 @@ for r in aggregate(records):                                   # detection rate 
     print(r.condition, r.successes, "/", r.n)
 ```
 
+To use a recovered or custom baseline appendix, pass `--baseline-file path/to/words.txt` to the runner; it accepts one word per line and ignores blanks, comments, and repeated words.
+
 ## Architecture
 ```mermaid
 flowchart LR
