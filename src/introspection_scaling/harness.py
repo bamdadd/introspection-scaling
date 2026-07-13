@@ -723,6 +723,43 @@ def _assert_injectable(inject: ConceptVectorLike, layer: int) -> _FloatArray:
     return v
 
 
+def _resolve_torch_dtype(dtype: str) -> Any:
+    """Map the shared ``dtype`` string to a torch dtype (contract: float32 |
+    float16 | bfloat16)."""
+    import torch
+
+    table = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if dtype not in table:
+        raise ValueError(f"unknown dtype {dtype!r}; expected one of {sorted(table)}")
+    return table[dtype]
+
+
+def _build_quant_config(quant: str | None, compute_dtype: Any) -> Any:
+    """Build a bitsandbytes 4-bit config for the shared ``quant`` string.
+
+    Contract: ``quant=None`` (unquantized) or ``'nf4'`` (bitsandbytes 4-bit NF4,
+    double-quant). NF4 weights are 4-bit but the residual stream stays in
+    ``compute_dtype`` (fp16/bf16) — injection acts on that fp16 residual.
+    Requires a CUDA GPU + bitsandbytes at model-load time.
+    """
+    if quant is None:
+        return None
+    if quant != "nf4":
+        raise ValueError(f"unsupported quant {quant!r}; only None or 'nf4'")
+    from transformers import BitsAndBytesConfig
+
+    return BitsAndBytesConfig(  # type: ignore[no-untyped-call]
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+    )
+
+
 class RepengGenerator:
     """Injects a concept vector via repeng ``ControlModel`` and samples a reply.
 
@@ -743,16 +780,24 @@ class RepengGenerator:
         model_id: str,
         *,
         device: str = "cpu",
+        dtype: str = "float32",
+        quant: str | None = None,
         max_new_tokens: int = 200,
         temperature: float = 1.0,
         inject_span: str = "full",
     ) -> None:
+        """``dtype`` and ``quant`` are the shared ladder contract (match A1/A3):
+        ``dtype`` in {float32, float16, bfloat16}; ``quant`` is None or ``'nf4'``
+        (bitsandbytes 4-bit). NF4 uses ``device_map='auto'`` and needs a CUDA GPU.
+        """
         import torch
         from repeng import ControlModel  # type: ignore[import-untyped]
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.model_id = model_id
         self.device = device
+        self.dtype = dtype
+        self.quant = quant
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         if inject_span != "full":
@@ -762,13 +807,23 @@ class RepengGenerator:
             )
         self.inject_span = inject_span
 
+        torch_dtype = _resolve_torch_dtype(dtype)
+        quant_config = _build_quant_config(quant, torch_dtype)
+
         # Glue around untyped repeng — keep model/tokenizer as Any deliberately.
         self._torch: Any = torch
         self.tokenizer: Any = AutoTokenizer.from_pretrained(model_id)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        base: Any = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
-        base.to(device)
+        if quant_config is not None:
+            # 4-bit: let accelerate place shards; do NOT call .to() on a quantized
+            # model (bitsandbytes forbids it). Weights are 4-bit, residual is fp16.
+            base: Any = AutoModelForCausalLM.from_pretrained(
+                model_id, quantization_config=quant_config, device_map="auto"
+            )
+        else:
+            base = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch_dtype)
+            base.to(device)
         n_layers = int(base.config.num_hidden_layers)
         # Wrap ALL layers so any chosen injection layer is controllable.
         self._model: Any = ControlModel(base, list(range(n_layers)))

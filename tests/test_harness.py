@@ -19,8 +19,10 @@ from introspection_scaling.harness import (
     JudgeVerdict,
     RuleBasedJudge,
     TrialRecord,
+    _build_quant_config,
     _failed_verdict,
     _parse_verdict,
+    _resolve_torch_dtype,
     aggregate,
     build_prompt,
     dose_alpha,
@@ -108,6 +110,29 @@ class ScriptedGenerator:
 
 
 # --- tests ----------------------------------------------------------------- #
+
+
+def test_resolve_torch_dtype():
+    import torch
+
+    assert _resolve_torch_dtype("float32") is torch.float32
+    assert _resolve_torch_dtype("float16") is torch.float16
+    assert _resolve_torch_dtype("bfloat16") is torch.bfloat16
+    with pytest.raises(ValueError, match="unknown dtype"):
+        _resolve_torch_dtype("int8")
+
+
+def test_build_quant_config():
+    import torch
+
+    # shared contract: None (unquantized) or 'nf4'
+    assert _build_quant_config(None, torch.float16) is None
+    with pytest.raises(ValueError, match="unsupported quant"):
+        _build_quant_config("gptq", torch.float16)
+    cfg = _build_quant_config("nf4", torch.float16)
+    assert cfg.load_in_4bit is True
+    assert cfg.bnb_4bit_quant_type == "nf4"
+    assert cfg.bnb_4bit_use_double_quant is True
 
 
 def test_prompt_is_verbatim():
