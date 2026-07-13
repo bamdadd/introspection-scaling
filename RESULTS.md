@@ -82,82 +82,49 @@ is therefore a real scaling data point, not an instrument failure.
 
 ---
 
-## Cost estimate (write BEFORE any full Modal sweep) — budget < $200
+## Cost estimate — flagship emergence run (hard Modal GPU cap $80)
 
-**Ladder = instruct variants** (`Qwen2.5-*-Instruct`, `Llama-3.*-Instruct`): the
-introspection task is a chat self-report, so base models can't follow it and
-would manufacture false nulls. Parameter counts are unchanged from the base
-ladder, so the compute envelope is unchanged in *shape* — but the numbers below
-are re-derived for **float32** (see next paragraph), which is the real cost
-driver, not the base→instruct swap.
+**Design.** 9 fireable instruct rungs, **ascending** (Qwen 0.5/1.5/3/7/14/32B +
+Llama 1/3/8B), **fp16** (SHARED CONTRACT `dtype`/`quant`; 32B fp16 ≈ 64 GB fits an
+A100-80GB via the two-phase load). Config **6 concepts × 12 trials × 3 seeds ×
+3 conditions = 648 generations/model**. Injection: depth 0.61, α = 0.044·‖resid‖.
+The 72B anchor is **held** (nf4 + A2 DE-RISK) and costed separately below.
 
-**Injection parameters (orch-2, no effect on trial counts):** depth fraction
-**0.61** (layer = round(0.61·N)); dose **α = 0.044 · resid_norm** (norm-relative,
-under the 0.09 coherence-cliff ceiling). These set *which* layer / *how hard*,
-not *how many* generations — cost is unchanged by them.
+**Rate biased HIGH** at **$4.00 / A100-80GB-h** — a money guard should err high so
+it trips early (under-spend), the safe direction for a cap we can't verify live.
 
-| Dimension  | Count | Notes |
-|------------|------:|-------|
-| Models     | 8     | Qwen2.5 {0.5,1.5,3,7,14}B-Instruct + Llama3.x {1,3,8}B-Instruct |
-| Conditions | 3     | injected + no_injection + random_direction (all reported) |
-| Seeds      | 3     | ≥3 required for bands |
-| Concepts   | 10    | subset of the paper's 50 |
-| Trials     | 20    | per (concept, condition, seed); temperature 1 |
+Per-rung GPU-hours (gen at 648/model fp16 + extraction + two loads; biased high):
 
-Introspection generations per model = 3 × 3 × 10 × 20 = **1,800**; ×8 models =
-**14,400** generations, plus one extraction pass per (model, concept).
+| Rung (fp16)   | GPU-h | $ @ $4/h |
+|---------------|------:|---------:|
+| Qwen 0.5B     | 0.3   | $1.20 |
+| Qwen 1.5B     | 0.5   | $2.00 |
+| Qwen 3B       | 0.8   | $3.20 |
+| Qwen 7B       | 1.4   | $5.60 |
+| Qwen 14B      | 2.4   | $9.60 |
+| Qwen 32B      | 4.5   | $18.00 |
+| Llama 1B      | 0.4   | $1.60 |
+| Llama 3B      | 0.8   | $3.20 |
+| Llama 8B      | 1.5   | $6.00 |
+| **Fireable total** | **12.6** | **≈ $50.4** |
 
-**GPU = A100-80GB, float32, 200-token responses.** A1's `extract` and A2's
-`RepengGenerator` both hold the model in **float32** (14B fp32 ≈ 56 GB → needs
-80 GB, and the runner is two-phase so extraction and ControlModel are never
-co-resident). fp32 + 200 tokens is ~1.8× the fp16/150-token figures, so 14B/8B
-dominate harder:
+**Projected Modal GPU ≈ $50.4 ≤ $80 cap** — with ~$30 headroom absorbed by the
+guard. The runner's hard self-stop projects `spent(measured) + next-rung-est`
+before each rung and stops + commits the partial curve if it would breach $80, so
+even if real time overruns these estimates the cap holds. Workspace hard-caps
+$100/cycle ($11.57 used) → the $80 self-stop keeps a safe margin under that too.
 
-| Model      | s/gen (fp32) | gen-hours (1,800 gen) |
-|------------|-------------:|----------------------:|
-| Qwen 0.5B  | 0.7          | 0.35 |
-| Qwen 1.5B  | 1.3          | 0.65 |
-| Qwen 3B    | 1.9          | 0.95 |
-| Qwen 7B    | 4.5          | 2.25 |
-| Qwen 14B   | 8.5          | 4.25 |
-| Llama 1B   | 1.1          | 0.55 |
-| Llama 3B   | 1.9          | 0.95 |
-| Llama 8B   | 5.0          | 2.50 |
-| **gen total** |          | **≈ 12.4** |
+**LLM-judge (Anthropic, faithful grader) — SEPARATE from the $80 GPU cap.**
+9 rungs × 648 grades ≈ 5,832 grades × ~(1k in + 200 out) tokens. Order **~$40**
+(confirm against current Anthropic pricing before running — do not trust blind).
 
-**Extraction (repeng diff-of-means) — separate line item (per super-orch FLAG-3).**
-repeng runs **2 forward passes per concept** (positive `"Tell me about {concept}"`
-+ negative `"Tell me about {baseline}"`). Nominal passes = 2 × 10 concepts ×
-8 models = **160** short forward passes. If each concept word is paired against
-`B` baseline words (the paper's diff-of-means uses a 100-word baseline list),
-multiply by `B`: upper bound 2 × 10 × **100** × 8 = **16,000** short passes.
-These are short prompts (no long generation), so even the paired upper bound is
-cheap — dominated by 14B/8B, ~**1.0–1.5 GPU-h** total across the ladder. Use
-`B ≈ 20` baselines/concept in practice (3,200 passes ≈ 0.5 GPU-h) unless A1's
-extraction quality needs the full list.
+**72B anchor — HELD, costed separately (NOT in the $80 fireable total).** bf16 +
+4-bit nf4 on 1×A100-80GB; ~8 GPU-h ≈ **$32** GPU + its judge share. Runs only
+after A2's DE-RISK verdict that repeng injection works under 4-bit **and**
+bitsandbytes lands in the lock.
 
-| Cost line                       | GPU-h |
-|---------------------------------|------:|
-| Trial inference (gen, fp32)     | 12.4  |
-| Extraction (repeng, fp32)       | ~1.5  |
-| Model-load / overhead (2 loads/model, two-phase) | ~1.5 |
-| **Subtotal**                    | **~15.4** |
-| **× 2 safety factor**           | **~31** |
-
-At **~$3.72 / A100-80GB-h** (Modal): **≈ $57** nominal, **≈ $115** with the 2×
-headroom. **Under the $200 budget** — but the 80GB rate + fp32 leave less slack
-than the base/fp16 estimate did; watch the 14B run.
-
-**LLM-judge (Anthropic API, A2's faithful grader)** — 14,400 grades × ~(1k in +
-200 out) tokens ≈ 14M in / 3M out. On a Haiku-class grader this is order **~$30**
-(confirm against current Anthropic pricing before running — do not trust this
-figure blind). **Total envelope ≈ $115 GPU + $30 judge ≈ $145.**
-
-**If the total ever exceeds $200, cut in this order (named, not silent):**
-concepts 10 → 6, then trials 20 → 12. Both shrink GPU *and* judge cost linearly.
-Do not shrink models or seeds — the ladder and the bands are the contribution.
-A dtype knob (fp16/bf16) on extract + RepengGenerator would roughly halve GPU
-cost and drop 14B to a 40GB A100 — flag to A1/A2 if budget tightens.
+**If a rung overruns and the guard trips:** a partial ascending curve (low-end
+rungs, where the emergence threshold likely sits) is still a publishable result.
 
 Dev on Qwen2.5-0.5B-Instruct locally (CPU ok); Modal only for the ladder.
 

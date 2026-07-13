@@ -11,11 +11,11 @@ Two entrypoints:
 
 * ``smoke`` (``modal run modal_app.py``) — loads Qwen2.5-0.5B-Instruct on an A100
   and returns its hidden size; proves the pinned image works end-to-end on GPU.
-* ``run_ladder`` (``modal run modal_app.py::run_ladder``) — the full sweep:
-  extract (A1) + inject/judge (A2) across the instruct ladder, writing
-  ``SeedRecord`` JSONL to a Modal Volume. Sized **A100-80GB** because both
-  extraction and the ControlModel hold the model in float32 (14B fp32 ≈ 56 GB;
-  see ``runner.run_ladder`` two-phase docs).
+* ``run_ladder`` (``modal run modal_app.py::ladder``) — the emergence sweep:
+  extract (A1) + inject/judge (A2) across the instruct ladder (Qwen first, Llama
+  preflight-gated, 72B held), writing ``SeedRecord`` JSONL to a Modal Volume.
+  Sized **A100-80GB** — fp16 for ≤32B (32B fp16 ≈ 64 GB) via the two-phase load;
+  the $80 cost guard self-stops and commits a partial curve.
 
 Required Modal secrets (create once; values never live in this repo). Names are
 configurable via ``HF_SECRET_NAME`` / ``ANTHROPIC_SECRET_NAME`` — defaults match
@@ -119,39 +119,93 @@ _SECRETS = [
     modal.Secret.from_name(ANTHROPIC_SECRET_NAME),
 ]
 
-# Instruct ladder (chat self-report — base models can't follow the protocol).
-DEFAULT_LADDER: tuple[str, ...] = (
+# ------------------------------- Ladder ------------------------------------- #
+# Ascending by params so a cost-guard stop preserves the MOST rungs — and the low
+# end is where the emergence threshold likely sits, so the partial curve is the
+# useful part. Qwen rungs are all UNGATED; Llama is gated (preflight below).
+QWEN_LADDER: tuple[str, ...] = (
     "Qwen/Qwen2.5-0.5B-Instruct",
     "Qwen/Qwen2.5-1.5B-Instruct",
     "Qwen/Qwen2.5-3B-Instruct",
     "Qwen/Qwen2.5-7B-Instruct",
     "Qwen/Qwen2.5-14B-Instruct",
+    "Qwen/Qwen2.5-32B-Instruct",
+)
+LLAMA_LADDER: tuple[str, ...] = (
     "meta-llama/Llama-3.2-1B-Instruct",
     "meta-llama/Llama-3.2-3B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct",
 )
+# 72B anchor is HELD — excluded from the fireable set. Double-blocked: needs
+# bitsandbytes/nf4 AND A2's DE-RISK verdict that repeng injection works in 4-bit.
+HELD_ANCHOR_72B = "Qwen/Qwen2.5-72B-Instruct"
+
+# Per-model precision (SHARED CONTRACT). <=32B -> fp16; 72B anchor -> bf16 + nf4.
+PRECISION_MAP: dict[str, tuple[str, str | None]] = {
+    **{m: ("float16", None) for m in QWEN_LADDER + LLAMA_LADDER},
+    HELD_ANCHOR_72B: ("bfloat16", "nf4"),
+}
+
+# Money cost guard. Rate biased HIGH: erring high trips the guard early (=under-
+# spend), the safe direction for a cap we cannot verify live from here.
+A100_80GB_USD_PER_HOUR = 4.00  # guard correctness depends on this being >= real
+MODAL_GPU_CAP_USD = 80.0  # hard self-stop for THIS run (workspace caps $100)
+
+# GPU-hours per rung (fp16, 6 concepts x 12 trials x 3 seeds = 648 gen/model, plus
+# extraction + two model loads). See RESULTS "Cost estimate"; biased high.
+RUNG_GPU_HOURS: dict[str, float] = {
+    "Qwen/Qwen2.5-0.5B-Instruct": 0.3,
+    "Qwen/Qwen2.5-1.5B-Instruct": 0.5,
+    "Qwen/Qwen2.5-3B-Instruct": 0.8,
+    "Qwen/Qwen2.5-7B-Instruct": 1.4,
+    "Qwen/Qwen2.5-14B-Instruct": 2.4,
+    "Qwen/Qwen2.5-32B-Instruct": 4.5,
+    "meta-llama/Llama-3.2-1B-Instruct": 0.4,
+    "meta-llama/Llama-3.2-3B-Instruct": 0.8,
+    "meta-llama/Llama-3.1-8B-Instruct": 1.5,
+}
+
+
+def _llama_preflight() -> tuple[bool, str]:
+    """Cheap gated-access probe: pull a Llama config + tokenizer (no weights).
+
+    On 401/403 (license not accepted yet) returns ``(False, reason)`` so the
+    caller runs the Qwen curve and defers Llama — the Llama license must NOT
+    block the Qwen curve.
+    """
+    probe = LLAMA_LADDER[0]
+    try:
+        from transformers import AutoConfig, AutoTokenizer
+
+        AutoConfig.from_pretrained(probe, cache_dir=_HF_CACHE_DIR)
+        AutoTokenizer.from_pretrained(probe, cache_dir=_HF_CACHE_DIR)
+        return True, f"gated access OK ({probe})"
+    except Exception as exc:  # noqa: BLE001 - any gate/auth failure defers Llama
+        return False, f"Llama gated access not live ({type(exc).__name__}); deferring Llama rungs"
 
 
 @app.function(
     image=_ladder_image,
-    gpu="A100-80GB",  # 14B float32 ≈ 56 GB (extract + ControlModel, two-phase)
+    gpu="A100-80GB",  # 32B fp16 ≈ 64 GB (extract + ControlModel, two-phase)
     volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
     secrets=_SECRETS,
     timeout=24 * 3600,
 )
 def run_ladder(
-    models: list[str],
     concepts: list[str],
     seeds: list[int],
-    n_trials: int = 20,
+    n_trials: int = 12,
     depth_fraction: float = 0.61,
     dose_fraction: float = 0.044,
+    models: list[str] | None = None,
 ) -> dict[str, object]:
-    """Run the ladder sweep on GPU and persist ``records.jsonl`` to the volume.
+    """Run the emergence ladder on GPU and persist ``records.jsonl`` incrementally.
 
-    Delegates all science to ``runner.run_ladder`` (A1 extract + A2 harness); the
-    faithful Anthropic judge is used (needs ``ANTHROPIC_API_KEY`` from the
-    Anthropic secret) — no silent fallback.
+    Order: Qwen rungs (ungated) ALWAYS run first; Llama rungs are appended only if
+    the gated-access preflight passes, else deferred (logged). The 72B anchor is
+    NOT included (held). Per-model precision from ``PRECISION_MAP`` (fp16 <=32B).
+    The $80 cost guard self-stops before a rung that would breach the cap and
+    commits the partial curve. Faithful Anthropic judge (no silent fallback).
     """
     from introspection_scaling.runner import run_ladder as _run
 
@@ -160,8 +214,17 @@ def run_ladder(
     # legacy name so auth works regardless of which the loader/version checks.
     if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
         os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    deferred_llama: list[str] = []
+    if models is None:
+        ok, reason = _llama_preflight()
+        print(f"[preflight] {reason}")
+        models = list(QWEN_LADDER) + (list(LLAMA_LADDER) if ok else [])
+        if not ok:
+            deferred_llama = list(LLAMA_LADDER)
+
     out = f"{_RESULTS_DIR}/records.jsonl"
-    records = _run(
+    result = _run(
         models,
         concepts=concepts,
         seeds=seeds,
@@ -170,10 +233,23 @@ def run_ladder(
         depth_fraction=depth_fraction,
         dose_fraction=dose_fraction,
         device="cuda",
+        precision_map=PRECISION_MAP,
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=MODAL_GPU_CAP_USD,
+        rung_gpu_hours=RUNG_GPU_HOURS,
+        on_model_done=_results_vol.commit,
     )
     _results_vol.commit()
     _hf_cache.commit()
-    return {"n_records": len(records), "out": out, "models": models}
+    return {
+        "n_records": len(result.records),
+        "out": out,
+        "ran": result.ran,
+        "skipped_by_cost_guard": result.skipped,
+        "deferred_llama_gated": deferred_llama,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+    }
 
 
 @app.local_entrypoint()
@@ -186,14 +262,17 @@ def main() -> None:
 
 
 @app.local_entrypoint()
-def ladder(n_concepts: int = 10, n_trials: int = 20) -> None:
-    """`modal run modal_app.py::ladder` — full instruct-ladder sweep on GPU.
+def ladder(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::ladder` — the emergence ladder on GPU.
 
-    Requires A2 harness on the path + the two Modal secrets. Writes records.jsonl
-    to the ``introspection-results`` volume (fetch with ``modal volume get``).
+    Config for the flagship run: 6 concepts x 12 trials x 3 seeds. Qwen rungs run
+    first (ungated); Llama appended iff the gated-access preflight passes; 72B
+    anchor held. The $80 cost guard self-stops + commits a partial curve. Requires
+    the two Modal secrets. Writes records.jsonl to the ``introspection-results``
+    volume (fetch with ``modal volume get``).
     """
     from introspection_scaling.extract import CONCEPT_WORDS
 
     concepts = list(CONCEPT_WORDS[:n_concepts])
-    result = run_ladder.remote(list(DEFAULT_LADDER), concepts, [0, 1, 2], n_trials=n_trials)
+    result = run_ladder.remote(concepts, [0, 1, 2], n_trials=n_trials)
     print("ladder result:", result)
