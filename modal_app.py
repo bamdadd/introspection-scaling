@@ -163,7 +163,14 @@ RUNG_GPU_HOURS: dict[str, float] = {
     "meta-llama/Llama-3.2-1B-Instruct": 0.4,
     "meta-llama/Llama-3.2-3B-Instruct": 0.8,
     "meta-llama/Llama-3.1-8B-Instruct": 1.5,
+    # 72B 4-bit anchor (bf16+nf4). Biased high so the $80 guard projection is real
+    # on a single-rung run (else it defaults to 0.0 and only the timeout backstops).
+    HELD_ANCHOR_72B: 8.0,
 }
+
+# 72B anchor records go to a SEPARATE volume path — write_records opens mode 'w'
+# (overwrite), so it must NOT share records.jsonl with the committed 0.5-32B run.
+ANCHOR_72B_RECORDS = f"{_RESULTS_DIR}/records_72b.jsonl"
 
 
 def _llama_preflight() -> tuple[bool, str]:
@@ -250,6 +257,146 @@ def run_ladder(
         "stopped_reason": result.stopped_reason,
         "spent_usd_gpu": round(result.spent_usd, 2),
     }
+
+
+# --------------------------- 72B anchor (4-bit) ----------------------------- #
+# DE-RISK gate + the held anchor rung, both A100-80GB with the bitsandbytes image.
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache},
+    secrets=_SECRETS,
+    timeout=3600,
+)
+def verify_4bit(model_id: str = "Qwen/Qwen2.5-0.5B-Instruct") -> dict[str, object]:
+    """DE-RISK: does repeng injection survive nf4? (image gate + injection gate.)
+
+    Compares ``verify_injection_delta`` under fp16 vs fp16+nf4 on ``model_id``
+    (default 0.5B — a cheap proxy; the 'nf4 leaves the residual stream in compute
+    dtype' argument is architecture-general). PASS iff nf4 magnitude_ratio ∈
+    [0.8,1.3] and cosine within 0.15 of fp16. Reports WHICH gate failed so a FAIL
+    distinguishes a broken bnb/CUDA image from injection breaking under nf4.
+    """
+    import numpy as np
+    import torch
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    # Image gate: can bitsandbytes import and see the GPU on this CUDA image?
+    try:
+        import bitsandbytes  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "verdict": "FAIL",
+            "failure_kind": "image/bitsandbytes-import",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not torch.cuda.is_available():
+        return {
+            "verdict": "FAIL",
+            "failure_kind": "image/no-cuda",
+            "error": "torch.cuda unavailable",
+        }
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.harness import RepengGenerator, dose_alpha, layer_for_fraction
+
+    def _one(dtype: str, quant: str | None) -> dict[str, float]:
+        gen = RepengGenerator(model_id, device="cuda", dtype=dtype, quant=quant, max_new_tokens=8)
+        cv = extract_concept_vector(model_id, "oceans", device="cuda")
+        layer = layer_for_fraction(gen.n_layers)
+        alpha = dose_alpha(gen.measure_resid_norm(layer), 0.044)
+        return {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+
+    try:
+        fp16 = _one("float16", None)
+        nf4 = _one("float16", "nf4")
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "verdict": "FAIL",
+            "failure_kind": "injection/runtime",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    ratio_ok = 0.8 <= nf4["magnitude_ratio"] <= 1.3
+    cos_ok = abs(nf4["cosine_to_v_unit"] - fp16["cosine_to_v_unit"]) < 0.15
+    ok = ratio_ok and cos_ok and bool(np.isfinite(nf4["delta_norm"]))
+    return {
+        "verdict": "PASS" if ok else "FAIL",
+        "failure_kind": None if ok else "injection-breaks-under-nf4",
+        "model_id": model_id,
+        "fp16": fp16,
+        "nf4": nf4,
+        "ratio_ok": ratio_ok,
+        "cos_ok": cos_ok,
+    }
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=_SECRETS,
+    timeout=24 * 3600,
+)
+def run_anchor_72b(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """Run the Qwen2.5-72B-Instruct anchor rung (bf16+nf4) to a SEPARATE path.
+
+    Writes ``records_72b.jsonl`` (never the committed records.jsonl). $80 cost
+    guard active. The caller inspects these records for the decision trigger
+    (quantized positive -> do NOT auto-commit) before any repo write.
+    """
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    result = _run(
+        [HELD_ANCHOR_72B],
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=ANCHOR_72B_RECORDS,
+        depth_fraction=0.61,
+        dose_fraction=0.044,
+        device="cuda",
+        precision_map=PRECISION_MAP,
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=MODAL_GPU_CAP_USD,
+        rung_gpu_hours=RUNG_GPU_HOURS,
+        on_model_done=_results_vol.commit,
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "n_records": len(result.records),
+        "out": ANCHOR_72B_RECORDS,
+        "ran": result.ran,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+    }
+
+
+@app.local_entrypoint()
+def verify4bit(model_id: str = "Qwen/Qwen2.5-0.5B-Instruct") -> None:
+    """`modal run modal_app.py::verify4bit` — DE-RISK gate for the 72B 4-bit anchor."""
+    result = verify_4bit.remote(model_id)
+    print("4-bit verify:", result)
+
+
+@app.local_entrypoint()
+def anchor72b(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::anchor72b` — 72B 4-bit anchor to records_72b.jsonl."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_anchor_72b.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("72B anchor:", result)
 
 
 @app.local_entrypoint()
