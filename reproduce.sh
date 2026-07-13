@@ -7,7 +7,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 SEEDS="${SEEDS:-0 1 2}"
-MODELS="${MODELS:-Qwen/Qwen2.5-0.5B Qwen/Qwen2.5-1.5B Qwen/Qwen2.5-3B Qwen/Qwen2.5-7B Qwen/Qwen2.5-14B meta-llama/Llama-3.2-1B meta-llama/Llama-3.2-3B meta-llama/Llama-3.1-8B}"
+# Instruct variants: the introspection task is a chat self-report; base models
+# can't follow the protocol and would manufacture false nulls.
+MODELS="${MODELS:-Qwen/Qwen2.5-0.5B-Instruct Qwen/Qwen2.5-1.5B-Instruct Qwen/Qwen2.5-3B-Instruct Qwen/Qwen2.5-7B-Instruct Qwen/Qwen2.5-14B-Instruct meta-llama/Llama-3.2-1B-Instruct meta-llama/Llama-3.2-3B-Instruct meta-llama/Llama-3.1-8B-Instruct}"
 RECORDS="${RECORDS:-results/records.jsonl}"
 CURVE="${CURVE:-results/scaling-curve.png}"
 
@@ -16,19 +18,22 @@ uv sync --frozen
 
 mkdir -p results
 
-# ─── SWEEP (deferred hook — owned by A1/A2) ──────────────────────────────────
-# Produces $RECORDS: one JSON line per (model, concept, condition, seed) as
-# introspection_scaling.records.SeedRecord (raw n_success / n_trials counts).
-# Locally develop on Qwen2.5-0.5B (CPU ok); run the full ladder on Modal.
-#   Local dev  : uv run python -m introspection_scaling.sweep --models "$MODELS" --seeds "$SEEDS" --out "$RECORDS"
-#   Modal ladder: modal run modal_app.py::run_ladder  (wired once the interface lands)
-# Controls (SPEC, non-negotiable): injected + no_injection + random_direction.
+# ─── SWEEP (runner wired; needs A2 harness on the path) ──────────────────────
+# introspection_scaling.runner.run_ladder drives A1 extraction + A2 harness and
+# emits SeedRecord JSONL (raw n_success / n_trials). Controls are handled inside
+# run_concept: injected + no_injection + random_direction (SPEC, non-negotiable).
+# Injection params (orch-2): depth 0.61, dose alpha = 0.044 * resid_norm.
+#   Local dev (0.5B, CPU): the command below (small n-trials/concepts for speed).
+#   Full ladder (GPU)    : modal run modal_app.py::ladder   (A100-80GB; needs
+#                          huggingface-secret + anthropic-secret).
+# BLOCKED until A2 harness (wt/agent2 49cc0ee) is on main; the runner fails loud
+# with an actionable message if harness is not importable.
 if [ ! -f "$RECORDS" ]; then
-  echo "[reproduce] MISSING $RECORDS — the A1/A2 sweep hook has not run yet." >&2
-  echo "[reproduce] models: $MODELS" >&2
-  echo "[reproduce] seeds:  $SEEDS" >&2
-  echo "[reproduce] TODO(A1/A2): write the sweep that emits SeedRecord JSONL to $RECORDS." >&2
-  exit 2
+  echo "[reproduce] generating $RECORDS via the ladder runner…"
+  uv run python -m introspection_scaling.runner \
+    --models $MODELS --seeds $SEEDS --out "$RECORDS" \
+    --n-concepts "${N_CONCEPTS:-10}" --n-trials "${N_TRIALS:-20}" \
+    --device "${DEVICE:-cpu}"
 fi
 
 # ─── AGGREGATE + PLOT (real, A3) ─────────────────────────────────────────────
