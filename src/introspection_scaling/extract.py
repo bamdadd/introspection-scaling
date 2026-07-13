@@ -1,27 +1,42 @@
 """Concept-vector extraction (A1).
 
-Thin wrapper around `repeng` that builds the paper's systematic diff-of-means
-contrast dataset, trains per-layer directions, and packages them as a
-:class:`ConceptVector` for the introspection harness (A2) to inject.
+Builds the paper's systematic **diff-of-means** contrast (concept vs baseline
+words) and packages the per-layer directions as a :class:`ConceptVector` for the
+introspection harness (A2) to inject.
 
-Extraction is NOT reimplemented here: the injected *direction* always comes from
-``repeng.ControlVector.train`` (method ``"pca_diff"``: PCA of the per-pair
-activation differences, which is unit-norm and, for strong single-concept
-contrasts, ~parallel to the normalized diff-of-means). We additionally compute
-``raw_norms`` — the L2 norm of the raw diff-of-means per layer — from a single
-`repeng` hidden-state pass. That scalar is reported/auxiliary; it does NOT drive
-injection magnitude (injection is fixed at ``h <- h + alpha * v_unit``, so the
-injected norm is ``alpha``). It is retained per the interface contract.
+Estimator — diff-of-means (the paper's method)
+----------------------------------------------
+For each layer, ``direction = unit(mean(h_positive) - mean(h_negative))`` and
+``raw_norm = ||mean(h_positive) - mean(h_negative)||`` — computed from ONE
+hidden-state pass over the contrast set. ``mean(pos) - mean(neg)`` already points
+toward the concept, so no sign correction is needed.
+
+We deliberately do NOT use ``repeng.ControlVector.train`` (method ``"pca_diff"``)
+for the direction. Our dataset uses a *constant* positive prompt, so the per-pair
+differences are ``h_concept - h_baseline_i`` whose mean is exactly the
+diff-of-means; sklearn's PCA centers the data before the SVD, subtracting that
+mean — i.e. it removes the concept signal and returns the top PC of baseline-word
+variation, a ~concept-independent axis (measured cos with diff-of-means ~0.1-0.4,
+and non-deterministic via randomized SVD). diff-of-means is the paper's stated
+estimator, is deterministic, and needs one forward pass. We still use `repeng`
+for the plumbing that matters for the seam: hidden-state extraction
+(``batched_get_hiddens``) and the layer-index convention below. (Estimator swap
+ruled in by orch-1; the :class:`ConceptVector` interface is unchanged.)
+
+``raw_norms`` is reported/auxiliary — it does NOT drive injection magnitude
+(injection is fixed at ``h <- h + alpha * v_unit``, so the injected norm is
+``alpha``); it is retained per the interface contract and now matches the
+direction it accompanies.
 
 Layer-index convention (A1 owns this; A2 MUST agree)
 ----------------------------------------------------
-`repeng` keys each direction by ``L`` and reads ``hidden_states[L + 1]``, i.e.
-the *output of transformer block L* (``hidden_states[0]`` is the embedding
+`repeng`'s ``batched_get_hiddens`` keys layer ``L`` to ``hidden_states[L + 1]``,
+i.e. the *output of transformer block L* (``hidden_states[0]`` is the embedding
 output). We adopt those keys verbatim: ``ConceptVector.directions[i]`` is the
 unit direction at the output of block ``i``, 0-based. These are repeng-native
 block-output indices — A2 passes them straight into ``ControlModel`` with **no
 offset**. Passing ``hidden_layers=range(num_hidden_layers)`` extracts every
-block (0..N-1); repeng's default would skip block 0 and yield only N-1 layers.
+block (0..N-1).
 """
 
 from __future__ import annotations
@@ -31,7 +46,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import numpy.typing as npt
 import torch
-from repeng import ControlModel, ControlVector, DatasetEntry  # type: ignore[import-untyped]
+from repeng import DatasetEntry  # type: ignore[import-untyped]
 from repeng.extract import batched_get_hiddens  # type: ignore[import-untyped]
 from transformers import (
     AutoModelForCausalLM,
@@ -103,12 +118,15 @@ CONCEPT_WORDS: tuple[str, ...] = (
 
 # 100 baseline words.
 #
-# NOTE: this is a *documented substitute*, not the paper's verbatim 100-word
-# baseline appendix (not recovered verbatim at build time — flagged to orch-1).
-# It is a fixed set of common, concrete, high-frequency nouns disjoint from
+# RECONSTRUCTED SUBSTITUTE (orch-1 ruling): this is NOT the paper's verbatim
+# 100-word baseline appendix — that appendix was not released publicly. It is a
+# fixed, documented set of 100 common concrete nouns, disjoint from
 # CONCEPT_WORDS, so each concept is contrasted against a broad, neutral bag of
-# unrelated words. Swap in the verbatim list here if/when recovered; the
-# interface is unaffected.
+# unrelated words. This substitution is disclosed in RESULTS.md under "what was
+# underspecified in the paper" — surfaced, not hidden.
+#
+# >>> SWAP-IN POINT <<< if the verbatim baseline list is ever recovered, replace
+# the tuple below with it; nothing else changes (the interface is unaffected).
 BASELINE_WORDS: tuple[str, ...] = (
     "table",
     "window",
@@ -270,17 +288,14 @@ def extract_concept_vector(
 ) -> ConceptVector:
     """Extract a :class:`ConceptVector` for ``concept`` on ``model_id``.
 
-    Passes ``hidden_layers`` through to repeng (default: every block,
-    ``range(num_hidden_layers)``). ``model``/``tokenizer`` may be supplied to
-    reuse a loaded model across concepts; otherwise they are loaded on ``device``
-    in float32.
+    ``hidden_layers`` defaults to every block (``range(num_hidden_layers)``).
+    ``model``/``tokenizer`` may be supplied to reuse a loaded model across
+    concepts; otherwise they are loaded on ``device`` in float32.
 
-    Does two forward passes over the contrast set: one inside
-    ``ControlVector.train`` (for the directions) and one via
-    ``batched_get_hiddens`` (for ``raw_norms``). Fine for dev-scale models;
-    flagged to orch-1/A3 as an optimization target for the large ladder.
+    One forward pass over the contrast set (``batched_get_hiddens``); both the
+    unit directions and ``raw_norms`` come from the same diff-of-means, so they
+    are consistent and the result is deterministic.
     """
-    owns_model = model is None
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
@@ -290,57 +305,40 @@ def extract_concept_vector(
         # transformers' typed `.to` overload confuses mypy-strict; runtime is fine.
         model = model.to(torch.device(device))  # type: ignore[arg-type]
 
-    try:
-        n_blocks = int(model.config.num_hidden_layers)
-        if hidden_layers is None:
-            hidden_layers = list(range(n_blocks))
-        control_model = ControlModel(model, list(hidden_layers))
+    if hidden_layers is None:
+        hidden_layers = list(range(int(model.config.num_hidden_layers)))
 
-        dataset = build_dataset(concept, baseline_words)
-
-        # Direction: repeng PCA-of-differences (unit-norm). Do NOT reimplement.
-        cv = ControlVector.train(
-            control_model,
-            tokenizer,
-            dataset,
-            hidden_layers=hidden_layers,
-            batch_size=batch_size,
-        )
-        directions = {layer: _unit(vec.astype(np.float32)) for layer, vec in cv.directions.items()}
-
-        # raw_norms: L2 norm of the raw diff-of-means, same repeng hidden pass.
-        raw_norms = _raw_diff_of_means_norms(
-            control_model, tokenizer, dataset, list(hidden_layers), batch_size
-        )
-    finally:
-        if owns_model:
-            # Restore the underlying model in case the caller reuses it.
-            control_model.reset()
-
+    dataset = build_dataset(concept, baseline_words)
+    directions, raw_norms = _diff_of_means(
+        model, tokenizer, dataset, list(hidden_layers), batch_size
+    )
     return ConceptVector(
         concept=concept, model_id=model_id, directions=directions, raw_norms=raw_norms
     )
 
 
-def _raw_diff_of_means_norms(
-    model: ControlModel,
+def _diff_of_means(
+    model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     dataset: list[DatasetEntry],
     hidden_layers: list[int],
     batch_size: int,
-) -> dict[int, float]:
-    """``||mean(h_pos) - mean(h_neg)||`` per layer, via repeng's hidden pass.
+) -> tuple[dict[int, Array], dict[int, float]]:
+    """Per-layer ``(unit direction, raw norm)`` from the diff-of-means.
 
-    Uses the same last-token, same layer keys as ``ControlVector.train`` so the
-    norms line up with the directions. Order is [pos, neg, pos, neg, ...].
+    Uses repeng's ``batched_get_hiddens`` (last-token hidden states; layer ``L``
+    -> output of block ``L``). Contrast order is [pos, neg, pos, neg, ...], so
+    ``mean(pos) - mean(neg)`` points toward the concept — no sign flip needed.
     """
     strs = [s for entry in dataset for s in (entry.positive, entry.negative)]
     hiddens = batched_get_hiddens(model, tokenizer, strs, hidden_layers, batch_size)
-    norms: dict[int, float] = {}
+    directions: dict[int, Array] = {}
+    raw_norms: dict[int, float] = {}
     for layer, h in hiddens.items():
-        diff_of_means = h[::2].mean(axis=0) - h[1::2].mean(axis=0)
-        norms[layer] = float(np.linalg.norm(diff_of_means))
-    return norms
+        diff_of_means = (h[::2].mean(axis=0) - h[1::2].mean(axis=0)).astype(np.float32)
+        raw_norms[layer] = float(np.linalg.norm(diff_of_means))
+        directions[layer] = _unit(diff_of_means)
+    return directions, raw_norms
 
 
 # ---------------------------------------------------------------------------
