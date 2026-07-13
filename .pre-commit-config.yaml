@@ -1,12 +1,32 @@
+# All hooks run in the project env via `uv run` (language: system) so they use
+# the pinned dev tools from uv.lock and resolve numpy/matplotlib/modal stubs.
+# This mirrors the CI steps exactly and avoids pre-commit building isolated
+# hook envs against a private package index.
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.0
+  - repo: local
     hooks:
       - id: ruff
-        args: [--fix]
+        name: ruff (lint, --fix)
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+        require_serial: true
       - id: ruff-format
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.14.0
-    hooks:
+        name: ruff (format)
+        entry: uv run ruff format
+        language: system
+        types: [python]
+        require_serial: true
       - id: mypy
-        additional_dependencies: []
+        name: mypy (strict)
+        entry: uv run mypy src
+        language: system
+        pass_filenames: false
+        types: [python]
+      - id: pytest
+        name: pytest
+        entry: uv run pytest -q
+        language: system
+        pass_filenames: false
+        types: [python]
+        stages: [pre-push]

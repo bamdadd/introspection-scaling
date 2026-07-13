@@ -9,10 +9,11 @@ build/
 .ruff_cache/
 .mypy_cache/
 .ipynb_checkpoints/
-# research artefacts — commit summaries, not raw dumps
+# research artefacts — commit summaries + the hero figure, not raw dumps
 runs/
 wandb/
 *.ckpt
 *.safetensors
 results/*.raw.json
+results/records.jsonl
 .DS_Store
