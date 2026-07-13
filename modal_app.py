@@ -30,7 +30,10 @@ APP_NAME = "introspection-scaling"
 # and runs `uv sync --frozen`, so the image == the committed lock.
 image = modal.Image.debian_slim(python_version="3.11").uv_sync(
     frozen=True,
-    extra_options="--no-install-project",
+    # --no-install-project: build ctx carries only lock + pyproject, not src/,
+    #   and the smoke path needs torch/transformers, not our own package.
+    # --no-dev: the runtime image needs no ruff/mypy/pytest — smaller, faster cold start.
+    extra_options="--no-install-project --no-dev",
     uv_version="0.10.8",  # match the local uv that authored the lock
 )
 
