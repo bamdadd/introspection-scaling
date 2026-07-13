@@ -4,12 +4,63 @@
 > Reproduce concept-injection detection, then chart detection rate vs
 > parameter count across two model-size ladders.
 
-<!-- HERO FIGURE: results/scaling-curve.png — put it above the fold once you have it. -->
+<!-- HERO: results/scaling-curve.png drops in here once the ladder run lands. -->
+> **Hero figure — the scaling curve — lands with the first ladder run.** It plots
+> detection-rate vs parameter count for both families, with the no-injection and
+> random-matched control bands. Until then the [architecture](#architecture)
+> diagram is the visual, and here is the earliest signal from the 0.5B pilot —
+> injecting an *oceans* vector bends the content even when the model can't yet
+> introspect on it:
+>
+> ```text
+> concept = oceans  ·  Qwen2.5-0.5B-Instruct  ·  injected, seed 0
+> "Water quality is one of the darkest themes in conservation efforts today…"
+> ```
 
 ## The question
 Large models can sometimes *detect* when a concept has been injected into
 their own activations (shown at 30B+, replicated at 70B). Unanswered: **at
 what scale does this appear, and how does it degrade as models shrink?**
+
+## Quickstart
+```bash
+uv sync                        # pinned env from uv.lock
+export ANTHROPIC_API_KEY=...    # the introspection judge
+./reproduce.sh                 # clean env → per-model detection rates + scaling curve
+```
+
+Or drive the pipeline directly:
+```python
+from introspection_scaling import (
+    extract_concept_vector, make_random_matched,
+    RepengGenerator, AnthropicJudge, run_concept, aggregate,
+)
+
+MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+cv    = extract_concept_vector(MODEL, "oceans", device="cpu")  # repeng diff-of-means → ConceptVector
+gen   = RepengGenerator(MODEL, device="cpu")                   # injects h += α·v_unit via ControlModel
+judge = AnthropicJudge()                                       # scores the self-report (needs API key)
+
+records = run_concept(                                         # inject @0.61 depth, α = 0.044·‖resid‖
+    cv, generator=gen, judge=judge, seeds=(0, 1, 2),
+    random_matched_fn=make_random_matched,                     # random-matched-norm control
+)
+for r in aggregate(records):                                   # detection rate per condition
+    print(r.condition, r.successes, "/", r.n)
+```
+
+## Architecture
+```mermaid
+flowchart LR
+  W["50 concept words<br/>vs baseline"] --> E["repeng<br/>diff-of-means"] --> CV["ConceptVector<br/>unit-L2 per layer"]
+  CV --> INJ["inject @0.61 depth<br/>α = 0.044·‖resid‖"]
+  P["introspection prompt<br/>native chat template"] --> INJ
+  INJ --> GEN["generate<br/>Qwen2.5 + Llama-3.x ladders"] --> J["Anthropic judge<br/>coherent AND correct-ID"] --> R["detection rate<br/>vs parameter count"]
+  CTRL["controls:<br/>no-injection ·<br/>random-matched norm"] --> INJ
+```
+Both controls run the **identical** path — only the injected vector differs
+(real concept · random of matched norm · nothing). Detection = the real concept
+scoring above *both* controls.
 
 ## How it works (plain language)
 
@@ -45,12 +96,6 @@ gap is the result, not the raw hit rate.
 the Qwen2.5 and Llama-3.x size ladders. If it climbs and crosses the controls at
 some size, that is a **scaling threshold**. If it stays at noise up to 14B, that
 is an **honest negative**. Both are findings; we publish whichever we get.
-
-## Reproduce
-```bash
-uv sync
-./reproduce.sh          # clean env → results table
-```
 
 ## Method (one paragraph)
 Extract concept vectors via contrastive/PCA extraction (repeng, not
