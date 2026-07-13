@@ -4,20 +4,20 @@ Runs the concept-injection introspection protocol from Lindsey et al.,
 "Emergent Introspective Awareness in Large Language Models" (Anthropic /
 Transformer Circuits, 2025), across three conditions reported side by side:
 
-    1. injected      — the real concept vector is injected
-    2. control_none  — no injection (false-positive floor)
-    3. control_random — a random matched-norm vector is injected
+    1. injected          — the real concept vector is injected
+    2. no_injection      — no injection (false-positive floor)
+    3. random_direction  — a random matched-norm vector is injected
 
 Nothing here biases toward a positive result: a NULL outcome (no condition above
 chance) is a first-class, cleanly reported result. See SPEC.md for the contract.
 
-Interfaces consumed from A1 (extraction): the ``ConceptVector`` dataclass and
+Interfaces consumed from A1 (``extract.py``): the ``ConceptVector`` dataclass and
 ``make_random_matched``. We depend on them structurally (``ConceptVectorLike``
-protocol) so this module type-checks and unit-tests standalone while A1 lands in
-parallel. The injection layer key convention is A1's (SPEC: 0-based
-hidden_states index = output of transformer block ``i``); we assert unit-norm and
-key presence at the seam so a mismatch fails loud at integration, not in a data
-table.
+protocol) so the harness stays decoupled and unit-tests standalone. Layer-key
+convention (confirmed with A1, ``extract.py``): ``directions[i]`` is the unit
+direction at the output of block ``i`` — a repeng-native block-output index passed
+straight into ``ControlModel`` with NO offset. We assert unit-norm and key
+presence at the seam so a mismatch fails loud, not in a data table.
 """
 
 from __future__ import annotations
