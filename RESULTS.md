@@ -42,9 +42,27 @@ Introspection generations per model = 3 × 3 × 10 × 20 = **1,800**; ×8 models
 | Llama 8B   | 2.8   | 1.40 |
 | **gen total** |    | **≈ 6.75** |
 
-Add extraction (~0.2 h/model ≈ 1.6 h) + model-load/overhead (~0.5 h) ≈ **9 GPU-h**.
-With a 2× safety factor → **~18 GPU-h**. At ~$3/A100-h (Modal): **≈ $55**, or
-**≈ $110** with the 2× headroom. **Well under the $200 budget.**
+**Extraction (repeng diff-of-means) — separate line item (per super-orch FLAG-3).**
+repeng runs **2 forward passes per concept** (positive `"Tell me about {concept}"`
++ negative `"Tell me about {baseline}"`). Nominal passes = 2 × 10 concepts ×
+8 models = **160** short forward passes. If each concept word is paired against
+`B` baseline words (the paper's diff-of-means uses a 100-word baseline list),
+multiply by `B`: upper bound 2 × 10 × **100** × 8 = **16,000** short passes.
+These are short prompts (no long generation), so even the paired upper bound is
+cheap — dominated by 14B/8B, ~**1.0–1.5 GPU-h** total across the ladder. Use
+`B ≈ 20` baselines/concept in practice (3,200 passes ≈ 0.5 GPU-h) unless A1's
+extraction quality needs the full list.
+
+| Cost line             | GPU-h |
+|-----------------------|------:|
+| Trial inference (gen) | 6.75  |
+| Extraction (repeng)   | ~1.0  |
+| Model-load / overhead | ~0.5  |
+| **Subtotal**          | **~8.3** |
+| **× 2 safety factor** | **~17** |
+
+At ~$3/A100-h (Modal): **≈ $50** nominal, **≈ $100** with the 2× headroom.
+**Well under the $200 budget.**
 
 **LLM-judge (Anthropic API, A2's grader)** — 14,400 grades × ~(1k in + 200 out)
 tokens ≈ 14M in / 3M out. On a Haiku-class grader this is order **~$30**
