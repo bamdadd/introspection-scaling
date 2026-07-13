@@ -42,9 +42,13 @@ wall-clock longer due to per-rung weight loads). **Judge:** Anthropic API, separ
 (~3,888 grading calls). Raw per-trial data: [`results/records.jsonl`](results/records.jsonl).
 
 **Limitations (stated before you ask):**
-- **72B not run.** The Qwen2.5-72B anchor is held pending a GPU check that
-  4-bit (nf4) quantization preserves injection (`scripts/verify_4bit_injection.py`);
-  we do not claim anything about the 70B-class regime yet.
+- **72B-4bit attempted; did not fit the single-A100 memory budget.** The 4-bit
+  injection check passed (`scripts/verify_4bit_injection.py`: nf4 magnitude_ratio
+  1.10, cosine 0.76 vs fp16 0.80), but the full Qwen2.5-72B load OOM'd — bnb
+  refused CPU/disk offload when `device_map` spilled past the provisioned GPU RAM.
+  Not run. A proper 72B needs a confirmed-fit A100-80GB or a multi-GPU
+  `device_map`. The finding stands at ≤32B; we make no claim about the 70B-class
+  regime.
 - **Llama-3.x not run.** The second family was deferred — the gated-license access
   on the run's HF token was not yet live at run time (auto-skipped by a preflight,
   Qwen curve unaffected). Single family so far.
