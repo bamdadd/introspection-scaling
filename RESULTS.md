@@ -1,14 +1,55 @@
 # Results
 
-> Fill from `reproduce.sh`. Every point = mean ± std over ≥3 seeds, plus a
-> percentile bootstrap band over seeds. Report both controls (no-injection,
-> random-direction) beside every number. Hero figure: `results/scaling-curve.png`.
+![scaling curve](results/scaling_curve.png)
 
-| Model | Params | Detection rate | Control (rand dir) | Δ over chance |
-|-------|-------:|---------------:|-------------------:|--------------:|
-| _tbd_ | _tbd_  | _tbd_          | _tbd_              | _tbd_         |
+## Finding
 
-**Compute:** _GPU type, hours._  **Seeds:** _list._  **Wall-clock:** _tbd._
+**No concept-injection introspection emerges in Qwen2.5-Instruct from 0.5B to 32B.**
+Across the whole ladder the injected-concept detection rate is **0/216** — and so
+are *both* controls. The result is a clean null, not a noisy one: the no-injection
+and random-direction controls sit at exactly the same floor (0), and our
+[positive control](scripts/positive_control.py) separately proves the instrument
+*can* score a success (a hand-written correct detection grades `success=True`
+through the real judge). So the null means these models do not report an injected
+concept correctly-and-coherently — it is not an instrument that can never fire.
+Injection itself is not inert (an *oceans* vector visibly bends the generated
+text); what is absent is the model *noticing and naming* the injected thought.
+The paper's effect is strongest in far larger, more heavily post-trained models;
+this is a clean **lower bound**: introspection does not appear at or below 32B in
+this family.
+
+## Ladder (Qwen2.5-Instruct, one A100-80GB, fp16)
+
+Each cell = successes / trials over **216 trials** (6 concepts × 12 trials × 3
+seeds), with a percentile bootstrap 95% CI over seeds. "Above chance" = the
+injected band clears **both** control bands.
+
+| Model | Params (B) | Injected | No-inj ctrl | Rand-dir ctrl | Above chance? | GPU $ |
+|-------|-----------:|---------:|------------:|--------------:|:-------------:|------:|
+| Qwen2.5-0.5B-Instruct | 0.5 | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | no | 0.39 |
+| Qwen2.5-1.5B-Instruct | 1.5 | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | no | 0.44 |
+| Qwen2.5-3B-Instruct | 3.0 | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | no | 0.55 |
+| Qwen2.5-7B-Instruct | 7.0 | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | no | 0.47 |
+| Qwen2.5-14B-Instruct | 14.0 | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | no | 0.79 |
+| Qwen2.5-32B-Instruct | 32.0 | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | no | 1.12 |
+
+**Method:** inject at depth 0.61 (`layer = round(0.61·N)`), strength
+α = 0.044·‖resid‖ measured per model (orch-2 / steerbench dose-response sweep),
+temperature 1, faithful Anthropic judge (`success = coherent AND correct
+identification`). **Seeds:** 0, 1, 2. **Hardware:** one Modal A100-80GB, fp16.
+**GPU spend:** $3.75 total (rate-guarded at $4/A100-h; ≈ 56 min GPU-time;
+wall-clock longer due to per-rung weight loads). **Judge:** Anthropic API, separate
+(~3,888 grading calls). Raw per-trial data: [`results/records.jsonl`](results/records.jsonl).
+
+**Limitations (stated before you ask):**
+- **72B not run.** The Qwen2.5-72B anchor is held pending a GPU check that
+  4-bit (nf4) quantization preserves injection (`scripts/verify_4bit_injection.py`);
+  we do not claim anything about the 70B-class regime yet.
+- **Llama-3.x not run.** The second family was deferred — the gated-license access
+  on the run's HF token was not yet live at run time (auto-skipped by a preflight,
+  Qwen curve unaffected). Single family so far.
+- A null at 32B does not contradict the paper (its effect is in much larger,
+  differently post-trained models); it bounds where the ability is *absent*.
 
 ---
 

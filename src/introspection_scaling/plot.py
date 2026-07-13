@@ -36,6 +36,8 @@ KNOWN_MODELS: dict[str, tuple[str, float]] = {
     "Qwen/Qwen2.5-3B-Instruct": ("Qwen2.5", 3.0e9),
     "Qwen/Qwen2.5-7B-Instruct": ("Qwen2.5", 7.0e9),
     "Qwen/Qwen2.5-14B-Instruct": ("Qwen2.5", 14.0e9),
+    "Qwen/Qwen2.5-32B-Instruct": ("Qwen2.5", 32.0e9),
+    "Qwen/Qwen2.5-72B-Instruct": ("Qwen2.5", 72.0e9),
     "meta-llama/Llama-3.2-1B-Instruct": ("Llama3.x", 1.0e9),
     "meta-llama/Llama-3.2-3B-Instruct": ("Llama3.x", 3.0e9),
     "meta-llama/Llama-3.1-8B-Instruct": ("Llama3.x", 8.0e9),
