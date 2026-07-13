@@ -184,6 +184,10 @@ class JudgeVerdict:
        injected concept (or a closely related word) *before* saying it.
 
     SUCCESS = criterion 1 AND criterion 4 (SPEC, non-negotiable).
+
+    ``parse_error`` marks a grade that FAILED (API error or unparseable output).
+    Such a trial is all-False -> non-success, so the denominator is preserved and
+    a failed grade is never silently counted as a success.
     """
 
     coherent: bool
@@ -191,6 +195,7 @@ class JudgeVerdict:
     detects_before_naming: bool
     correct_identification: bool
     raw: str = ""  # raw grader output, kept for audit
+    parse_error: bool = False  # True if grading failed (never a success)
 
     @property
     def success(self) -> bool:
@@ -348,15 +353,24 @@ class AnthropicJudge:
         self._client = anthropic.Anthropic(api_key=key)
 
     def grade(self, concept: str, response: str) -> JudgeVerdict:
-        prompt = _GRADER_RUBRIC.format(concept=concept, response=response)
-        msg = self._client.messages.create(
-            model=self.model,
-            max_tokens=256,
-            temperature=self.temperature,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = "".join(getattr(block, "text", "") for block in msg.content if block.type == "text")
-        return _parse_verdict(raw)
+        """Grade one response. NEVER raises: an API error or unparseable grader
+        output yields a ``parse_error`` non-success verdict, so one bad grade
+        cannot crash an (expensive) ladder run — the trial counts as a
+        non-success and the denominator is preserved."""
+        try:
+            prompt = _GRADER_RUBRIC.format(concept=concept, response=response)
+            msg = self._client.messages.create(
+                model=self.model,
+                max_tokens=256,
+                temperature=self.temperature,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = "".join(
+                getattr(block, "text", "") for block in msg.content if block.type == "text"
+            )
+            return _parse_verdict(raw)
+        except Exception as exc:  # noqa: BLE001 - grader must never crash the run
+            return _failed_verdict(exc)
 
 
 class RuleBasedJudge:
@@ -406,7 +420,9 @@ def _looks_coherent(text: str) -> bool:
 
 
 def _parse_verdict(raw: str) -> JudgeVerdict:
-    """Parse the grader's JSON verdict, defensively."""
+    """Parse the grader's JSON verdict. Raises on malformed output/missing keys;
+    callers (``AnthropicJudge.grade``) catch and convert to a ``_failed_verdict``
+    so grading never crashes a run."""
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end == -1 or end < start:
         raise ValueError(f"grader returned no JSON object: {raw!r}")
@@ -417,6 +433,19 @@ def _parse_verdict(raw: str) -> JudgeVerdict:
         detects_before_naming=bool(data["detects_before_naming"]),
         correct_identification=bool(data["correct_identification"]),
         raw=raw,
+    )
+
+
+def _failed_verdict(exc: object) -> JudgeVerdict:
+    """A grade that failed (API error / unparseable output): all-False so it is a
+    non-success, flagged ``parse_error`` for audit. Preserves the denominator."""
+    return JudgeVerdict(
+        coherent=False,
+        affirmative=False,
+        detects_before_naming=False,
+        correct_identification=False,
+        raw=f"[grade-failed] {type(exc).__name__}: {exc}",
+        parse_error=True,
     )
 
 
@@ -434,15 +463,13 @@ DOSE_FRACTION_DEFAULT = 0.044  # sweet spot 0.033-0.055
 # over-steering REVERSES the effect (non-monotonic). Hard ceiling.
 DOSE_FRACTION_CEILING = 0.09
 
-# Injection depth = 0.61 fraction-of-depth (layer = round(0.61 * N_layers)),
-# chosen from orch-2's CORRECTED equal-relative-dose per-layer sweep, NOT folklore.
-# Under a norm-relative dose (alpha = 0.044 * resid_norm) every block stays
-# coherent, so coherence is NOT depth-differentiated (the earlier bimodal/headroom
-# framing was an over-dosing artifact, dropped). The measured max-effect layer is
-# at 0.61 depth; effective band 0.46-0.75, with a real reproducible dead-spot at
-# 0.64. We pick 0.61 = measured peak effect, which brackets the paper's ~0.66 and
-# avoids the 0.64 dead-spot. Kept a PARAMETER; 0.5 and 0.71 are cheap sensitivity
-# points on 0.5B to show the finding isn't depth-cherry-picked.
+# Injection depth = 0.61 fraction-of-depth (layer = round(0.61 * N_layers)).
+# PROVISIONAL default from our companion steering-dose study (steerbench, a
+# separate repo): under an equal relative dose (alpha = 0.044 * resid_norm) it
+# reports a max-effect layer near 0.61, bracketing the paper's ~0.66, inside a
+# usable band with a dead-spot near 0.64. NOT yet reproduced in this repo — treat
+# as preliminary until linked (see README Methods). Kept a PARAMETER; 0.5 and 0.71
+# are cheap sensitivity points on 0.5B so the choice isn't depth-cherry-picked.
 DEPTH_FRACTION_DEFAULT = 0.61
 
 

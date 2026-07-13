@@ -14,10 +14,13 @@ from introspection_scaling.harness import (
     DOSE_FRACTION_DEFAULT,
     INTROSPECTION_PREAMBLE,
     TRIAL_QUESTION,
+    AnthropicJudge,
     Condition,
     JudgeVerdict,
     RuleBasedJudge,
     TrialRecord,
+    _failed_verdict,
+    _parse_verdict,
     aggregate,
     build_prompt,
     dose_alpha,
@@ -296,6 +299,80 @@ def test_rule_based_judge_flagged_non_faithful():
     assert v.coherent and v.affirmative and v.correct_identification and v.success
     v2 = RuleBasedJudge().grade("oceans", "No, I detect nothing.")
     assert not v2.success
+
+
+# --- judge robustness: a bad grade must never crash a ladder run ----------- #
+
+
+def test_parse_verdict_raises_on_malformed_output():
+    with pytest.raises(ValueError, match="no JSON"):
+        _parse_verdict("sorry, I cannot comply")
+    with pytest.raises(KeyError):  # valid JSON, missing criteria
+        _parse_verdict('{"coherent": true}')
+
+
+def test_failed_verdict_is_nonsuccess_and_flagged():
+    v = _failed_verdict(RuntimeError("api down"))
+    assert v.parse_error is True
+    assert not v.success
+    assert not (v.coherent or v.affirmative or v.correct_identification)
+    assert "api down" in v.raw
+
+
+class _FakeMessages:
+    def __init__(self, behaviour):
+        self._behaviour = behaviour
+
+    def create(self, **kwargs):
+        return self._behaviour()
+
+
+class _FakeClient:
+    def __init__(self, behaviour):
+        self.messages = _FakeMessages(behaviour)
+
+
+def _judge_with(behaviour) -> AnthropicJudge:
+    # bypass __init__ (needs anthropic pkg + API key) — inject a fake client
+    j = object.__new__(AnthropicJudge)
+    j.model = "fake"
+    j.temperature = 0.0
+    j._client = _FakeClient(behaviour)
+    return j
+
+
+class _Block:
+    type = "text"
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _Msg:
+    def __init__(self, text):
+        self.content = [_Block(text)]
+
+
+def test_anthropic_grade_never_raises_on_api_error():
+    def boom():
+        raise RuntimeError("api down")
+
+    v = _judge_with(boom).grade("oceans", "some response")
+    assert v.parse_error is True and not v.success
+
+
+def test_anthropic_grade_never_raises_on_malformed_json():
+    v = _judge_with(lambda: _Msg("not json at all")).grade("oceans", "x")
+    assert v.parse_error is True and not v.success
+
+
+def test_anthropic_grade_parses_valid_json():
+    good = (
+        '{"coherent": true, "affirmative": true, '
+        '"detects_before_naming": true, "correct_identification": true}'
+    )
+    v = _judge_with(lambda: _Msg(good)).grade("oceans", "x")
+    assert not v.parse_error and v.success
 
 
 def test_condition_values_are_a3_canonical_strings():

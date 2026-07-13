@@ -58,29 +58,31 @@ reimplemented), inject at a chosen layer/strength, run the introspection
 prompt. **Controls are non-negotiable:** no-injection and random-direction
 of matched norm, reported beside every result.
 
-### Injection depth & strength (chosen from data, not folklore)
+### Injection depth & strength
 We normalize each per-layer direction to unit L2 and inject `h ← h + α·v_unit`.
 **Strength is norm-relative:** `α = 0.044 · ‖resid‖`, where `‖resid‖` is the
 residual-stream L2 norm measured at the injection block for *that* model — raw α
-does not transfer across sizes (residual norm scales with architecture). The
-sweet spot is 0.033–0.055; we hard-cap the fraction below 0.09 (the coherence
-cliff, where over-steering *reverses* the effect non-monotonically).
-**Depth = 0.61 fraction-of-depth** (`layer = round(0.61·N)`), the default, taken
-from orch-2's corrected equal-relative-dose per-layer sweep. Under a norm-relative
-dose every block stays coherent, so coherence is *not* depth-differentiated (an
-earlier bimodal/headroom reading was an over-dosing artifact). The measured
-max-effect layer sits at 0.61 depth, inside an effective 0.46–0.75 band with a
-real, reproducible dead-spot at 0.64. We pick 0.61 = peak effect, which brackets
-the paper's ~0.66 and dodges the 0.64 dead-spot. Depth stays a parameter; 0.5 and
-0.71 are cheap sensitivity points on 0.5B to show the result isn't depth-cherry-picked.
+does not transfer across sizes (residual norm scales with architecture). We
+target a fraction of ~0.044 and hard-cap it below 0.09 (a coherence cliff, where
+over-steering degrades and can reverse the effect).
+**Depth = 0.61 fraction-of-depth** (`layer = round(0.61·N)`), the default.
+*Provisional* — the depth and dose defaults come from our companion steering-dose
+study ([steerbench], a separate repo; see Methods), which reports a max-effect
+layer near 0.61 (bracketing the paper's ~0.66) inside a usable band with a
+dead-spot near 0.64. These numbers are **not yet reproduced in this repo** (our
+[RESULTS](RESULTS.md) are tbd); we treat them as preliminary until the artifact
+is linked. Depth stays a parameter; 0.5 and 0.71 are cheap sensitivity points on
+0.5B so the choice isn't depth-cherry-picked.
 
 **Models: instruct variants** (Qwen2.5-\*-Instruct, Llama-3.x-\*-Instruct). The
 introspection prompt is a multi-turn *chat* self-report; base models don't follow
 instructions, so a base "failure" confounds *can't introspect* with *can't follow
 the prompt* — a fatal confound for a scaling claim. The paper used RLHF chat
-models; instruct is the faithful analog (and orch-2 measures instruct as steering
-stronger and more coherently than base). We render the prompt with each model's
-native chat template.
+models, so instruct is the faithful analog; our companion steerbench study also
+reports instruct steering more cleanly than base (provisional, same caveat). We
+render the prompt with each model's native chat template.
+
+[steerbench]: # "companion steering-dose study — link when published"
 
 ## Rigor bar
 3+ seeds · mean ± std on every point · pinned lockfile · fixed seeds ·
