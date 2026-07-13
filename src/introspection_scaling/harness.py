@@ -29,7 +29,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from introspection_scaling.records import (
     CONDITION_INJECTED,
@@ -40,10 +40,12 @@ from introspection_scaling.records import (
 )
 
 if TYPE_CHECKING:
-    import numpy as np
     import numpy.typing as npt
 
-    _FloatArray = npt.NDArray[np.float64]
+    from introspection_scaling.extract import ConceptVector
+
+    # dtype-agnostic: A1 ships float32 directions, our residual math uses float64
+    _FloatArray = npt.NDArray[Any]
 
 
 # --------------------------------------------------------------------------- #
@@ -114,12 +116,20 @@ def render_prompt(tokenizer: Any) -> str:
 
 @runtime_checkable
 class ConceptVectorLike(Protocol):
-    """Structural view of A1's ``ConceptVector`` (SPEC interface contract)."""
+    """Structural view of A1's ``ConceptVector`` (SPEC interface contract).
 
-    concept: str
-    model_id: str
-    directions: dict[int, _FloatArray]
-    raw_norms: dict[int, float]
+    Read-only members so A1's *frozen* ``ConceptVector`` (and test fakes) satisfy
+    it. Keeps the harness decoupled from A1's concrete class.
+    """
+
+    @property
+    def concept(self) -> str: ...
+    @property
+    def model_id(self) -> str: ...
+    @property
+    def directions(self) -> dict[int, _FloatArray]: ...
+    @property
+    def raw_norms(self) -> dict[int, float]: ...
 
 
 # Signature of A1's ``make_random_matched(cv, seed) -> ConceptVector``.
@@ -140,8 +150,10 @@ def _default_random_matched(cv: ConceptVectorLike, seed: int) -> ConceptVectorLi
             "introspection_scaling.extract is not importable. Pass "
             "random_matched_fn= explicitly."
         ) from exc
-    result: ConceptVectorLike = make_random_matched(cv, seed)
-    return result
+    # A1's make_random_matched is typed to the concrete ConceptVector; it works
+    # structurally on any ConceptVectorLike (uses dataclasses.replace). Cast at
+    # this bridge — the returned ConceptVector satisfies ConceptVectorLike.
+    return make_random_matched(cast("ConceptVector", cv), seed)
 
 
 # --------------------------------------------------------------------------- #
