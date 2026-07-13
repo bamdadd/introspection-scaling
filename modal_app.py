@@ -7,13 +7,16 @@ reproducibility guarantee. `--no-install-project` is passed because the build
 context carries only the lock + pyproject, not `src/`, and the smoke path needs
 only torch/transformers, not our own package.
 
-The full ladder RUNNER is deferred until the A1/A2 interface (ConceptVector +
-harness) lands — see SPEC "ladder runner (deferred until interface lands)". This
-file currently proves the image works end-to-end on GPU via `smoke`, which loads
-Qwen2.5-0.5B on an A100 and returns its hidden size.
+Two entrypoints:
 
-Run the smoke check:
-    modal run modal_app.py
+* ``smoke`` (``modal run modal_app.py``) — loads Qwen2.5-0.5B-Instruct on an A100
+  and returns its hidden size; proves the pinned image works end-to-end on GPU.
+* ``run_ladder`` (``modal run modal_app.py::run_ladder``) — the full sweep:
+  extract (A1) + inject/judge (A2) across the instruct ladder, writing
+  ``SeedRecord`` JSONL to a Modal Volume. Sized **A100-80GB** because both
+  extraction and the ControlModel hold the model in float32 (14B fp32 ≈ 56 GB;
+  see ``runner.run_ladder`` two-phase docs). **Blocked on A2 harness landing on
+  main** (pinned agent2 ``49cc0ee``); the wiring is complete and unit-tested.
 
 Pinned (from uv.lock at commit time): torch 2.13.0 (CUDA), transformers 5.13.1,
 modal 1.5.2. Python 3.11. Base: modal debian_slim.
@@ -43,7 +46,7 @@ app = modal.App(APP_NAME, image=image)
 _hf_cache = modal.Volume.from_name("introspection-hf-cache", create_if_missing=True)
 _HF_CACHE_DIR = "/root/.cache/huggingface"
 
-SMOKE_MODEL = "Qwen/Qwen2.5-0.5B"
+SMOKE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
 @app.function(gpu="A100", volumes={_HF_CACHE_DIR: _hf_cache}, timeout=900)
@@ -79,10 +82,98 @@ def smoke(model_id: str = SMOKE_MODEL) -> dict[str, object]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Full ladder sweep (blocked on A2 harness on main; wiring complete + tested).
+# --------------------------------------------------------------------------- #
+
+# The sweep needs our package (extract + harness + runner). Mount it into the
+# image; the pinned deps still come from the frozen lockfile.
+_ladder_image = image.add_local_python_source("introspection_scaling")
+
+# Persist records.jsonl across runs; download with `modal volume get`.
+_results_vol = modal.Volume.from_name("introspection-results", create_if_missing=True)
+_RESULTS_DIR = "/results"
+
+# Secrets (create once in the Modal workspace; see README/RESULTS):
+#   modal secret create huggingface-secret HF_TOKEN=...        (Llama is gated)
+#   modal secret create anthropic-secret ANTHROPIC_API_KEY=... (faithful judge)
+_SECRETS = [
+    modal.Secret.from_name("huggingface-secret"),
+    modal.Secret.from_name("anthropic-secret"),
+]
+
+# Instruct ladder (chat self-report — base models can't follow the protocol).
+DEFAULT_LADDER: tuple[str, ...] = (
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    "Qwen/Qwen2.5-1.5B-Instruct",
+    "Qwen/Qwen2.5-3B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-14B-Instruct",
+    "meta-llama/Llama-3.2-1B-Instruct",
+    "meta-llama/Llama-3.2-3B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
+)
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",  # 14B float32 ≈ 56 GB (extract + ControlModel, two-phase)
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=_SECRETS,
+    timeout=24 * 3600,
+)
+def run_ladder(
+    models: list[str],
+    concepts: list[str],
+    seeds: list[int],
+    n_trials: int = 20,
+    depth_fraction: float = 0.61,
+    dose_fraction: float = 0.044,
+) -> dict[str, object]:
+    """Run the ladder sweep on GPU and persist ``records.jsonl`` to the volume.
+
+    Delegates all science to ``runner.run_ladder`` (A1 extract + A2 harness); the
+    faithful Anthropic judge is used (``anthropic-secret``) — no silent fallback.
+    """
+    import os
+
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    out = f"{_RESULTS_DIR}/records.jsonl"
+    records = _run(
+        models,
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=out,
+        depth_fraction=depth_fraction,
+        dose_fraction=dose_fraction,
+        device="cuda",
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {"n_records": len(records), "out": out, "models": models}
+
+
 @app.local_entrypoint()
 def main() -> None:
     """`modal run modal_app.py` — run the GPU smoke check and print the result."""
     result = smoke.remote()
     print("smoke result:", result)
-    assert result["hidden_size"] == 896, result  # Qwen2.5-0.5B hidden size
+    assert result["hidden_size"] == 896, result  # Qwen2.5-0.5B-Instruct hidden size
     print("OK: image is GPU-capable and loads", result["model_id"])
+
+
+@app.local_entrypoint()
+def ladder(n_concepts: int = 10, n_trials: int = 20) -> None:
+    """`modal run modal_app.py::ladder` — full instruct-ladder sweep on GPU.
+
+    Requires A2 harness on the path + the two Modal secrets. Writes records.jsonl
+    to the ``introspection-results`` volume (fetch with ``modal volume get``).
+    """
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_ladder.remote(list(DEFAULT_LADDER), concepts, [0, 1, 2], n_trials=n_trials)
+    print("ladder result:", result)
