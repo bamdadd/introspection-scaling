@@ -1,5 +1,13 @@
 """introspection-scaling — see README."""
 
+from introspection_scaling.extract import (
+    BASELINE_WORDS,
+    CONCEPT_WORDS,
+    ConceptVector,
+    build_dataset,
+    extract_concept_vector,
+    make_random_matched,
+)
 from introspection_scaling.harness import (
     DEPTH_FRACTION_DEFAULT,
     DOSE_FRACTION_CEILING,
@@ -29,12 +37,15 @@ from introspection_scaling.harness import (
 __version__ = "0.0.1"
 
 __all__ = [
+    "BASELINE_WORDS",
+    "CONCEPT_WORDS",
     "DEPTH_FRACTION_DEFAULT",
     "DOSE_FRACTION_CEILING",
     "DOSE_FRACTION_DEFAULT",
     "AnthropicJudge",
-    "Condition",
+    "ConceptVector",
     "ConceptVectorLike",
+    "Condition",
     "ConditionRate",
     "DoseGenerator",
     "JudgeVerdict",
@@ -44,9 +55,12 @@ __all__ = [
     "TrialRecord",
     "__version__",
     "aggregate",
+    "build_dataset",
     "build_prompt",
     "dose_alpha",
+    "extract_concept_vector",
     "layer_for_fraction",
+    "make_random_matched",
     "render_prompt",
     "run_concept",
     "run_conditions",

@@ -74,3 +74,28 @@ concepts 10 → 6, then trials 20 → 12. Both shrink GPU *and* judge cost linea
 Do not shrink models or seeds — the ladder and the bands are the contribution.
 
 Dev on Qwen2.5-0.5B locally (CPU ok); Modal only for the ladder.
+
+## Method notes
+
+### What was underspecified in the paper (and how we resolved it)
+
+We reproduce Lindsey et al. (2025) as faithfully as the public materials allow.
+Where the paper leaves something unspecified, we disclose the choice rather than
+hide it:
+
+- **Baseline word list — reconstructed substitute.** The paper's 100-word
+  baseline appendix was not released publicly. We use a fixed, documented set of
+  100 common concrete nouns, disjoint from the 50 concept words, defined in
+  `BASELINE_WORDS` (`src/introspection_scaling/extract.py`) — the marked swap-in
+  point should the verbatim list ever surface. The 50 concept words are verbatim
+  from the paper. Concept vectors are diff-of-means over concept-vs-baseline
+  contrasts, so the baseline set is a broad neutral reference; the substitution
+  does not bias toward a positive result.
+- **Extraction estimator — diff-of-means.** The paper describes "systematic
+  diff-of-means" concept vectors. With our constant-positive contrast, an
+  off-the-shelf centered-PCA extractor (`repeng`'s `pca_diff`) removes the
+  concept signal and returns the top PC of the baseline activations
+  (`|cos|` with diff-of-means ~0.1-0.4; `|cos|` with PCA1 of the baselines
+  ~1.0; split-half stability ~0.3-0.8). We use diff-of-means directly
+  (split-half stability ~0.98, deterministic), which is the paper's stated
+  method. Documented upstream: vgel/repeng#77.
