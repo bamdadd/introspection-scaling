@@ -137,3 +137,30 @@ def test_extract_concept_vector_on_qwen() -> None:
     rm = make_random_matched(cv, seed=0)
     assert rm.raw_norms == cv.raw_norms
     assert set(rm.directions) == set(cv.directions)
+
+
+@pytest.mark.slow
+def test_extraction_is_deterministic() -> None:
+    """diff-of-means has no randomized solver: identical inputs -> identical dirs."""
+    a = extract_concept_vector(MODEL_ID, "Silver", baseline_words=BASELINE_WORDS[:20])
+    b = extract_concept_vector(MODEL_ID, "Silver", baseline_words=BASELINE_WORDS[:20])
+    assert all(np.array_equal(a.directions[layer], b.directions[layer]) for layer in a.directions)
+
+
+@pytest.mark.slow
+def test_direction_captures_concept_split_half_stability() -> None:
+    """The direction must actually encode the concept, not baseline noise.
+
+    Split the baselines in two, extract independently, and require the two
+    directions to agree. A concept-blind estimator (e.g. centered PCA on a
+    constant-positive contrast) fails this; diff-of-means scores ~0.98 here.
+    Threshold 0.90 sits well below the observed min (~0.96 across concepts).
+    """
+    concepts = ["Oceans", "Sadness"]
+    check_layers = [8, 16, 20]  # spans the default injection layer (16)
+    for concept in concepts:
+        first = extract_concept_vector(MODEL_ID, concept, baseline_words=BASELINE_WORDS[:50])
+        second = extract_concept_vector(MODEL_ID, concept, baseline_words=BASELINE_WORDS[50:])
+        for layer in check_layers:
+            cos = float(first.directions[layer] @ second.directions[layer])
+            assert cos > 0.90, f"{concept} layer {layer}: split-half cos {cos:.3f}"
