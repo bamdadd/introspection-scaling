@@ -106,24 +106,12 @@ class LadderRun:
 def _default_generator(
     model_id: str, dtype: str, quant: str | None, *, device: str
 ) -> DoseGeneratorLike:
-    """Build A2's RepengGenerator at the requested precision.
+    """Build A2's RepengGenerator at the requested precision (SHARED CONTRACT).
 
-    Fails LOUD if RepengGenerator does not yet accept ``dtype`` / ``quant`` — the
-    SHARED CONTRACT is pending on A2. No silent fp32 fallback: fp32 OOMs 32B on an
-    80 GB A100 and violates the fp16 policy, so a silent downgrade is worse than a
-    clear stop.
+    ``dtype`` / ``quant`` are now first-class on RepengGenerator, so no fp32
+    fallback exists: the requested precision is used or the load raises.
     """
-    # A2 must teach RepengGenerator to accept dtype/quant (SHARED CONTRACT, pending);
-    # call through an Any ref until then, and fail loud below if it doesn't.
-    gen_cls: Any = RepengGenerator
-    try:
-        gen: DoseGeneratorLike = gen_cls(model_id, device=device, dtype=dtype, quant=quant)
-    except TypeError as exc:
-        raise RuntimeError(
-            "RepengGenerator does not accept dtype/quant yet — A2 must implement "
-            "the SHARED CONTRACT (RepengGenerator(..., *, dtype: str, quant: str|None)). "
-            "Refusing to run: fp32 OOMs 32B on an 80GB A100 and breaks the fp16 policy."
-        ) from exc
+    gen: DoseGeneratorLike = RepengGenerator(model_id, device=device, dtype=dtype, quant=quant)
     return gen
 
 
