@@ -207,3 +207,24 @@ hide it:
   ~1.0; split-half stability ~0.3-0.8). We use diff-of-means directly
   (split-half stability ~0.98, deterministic), which is the paper's stated
   method. Documented upstream: vgel/repeng#77.
+
+---
+
+## Quantization caveat (70B rung — asymmetric interpretation)
+
+To fit the 70B-class rung in budget we run it 4-bit-quantized (bitsandbytes NF4).
+NF4 quantizes only the Linear *weights*; the residual stream stays fp16, so the
+injection `h += α·v_unit` still applies (confirmed empirically with
+`verify_injection_delta` on an NF4 model — see `scripts/verify_4bit_injection.py`).
+
+A quantized result is interpreted **asymmetrically**:
+
+- A **positive detection** from the 4-bit 70B is **trustworthy** — quantization
+  noise can only blur a signal, not manufacture one, so a signal that survives
+  4-bit is real (and stronger at full precision).
+- A quantized **null is suggestive, not conclusive** — 4-bit noise can blur a
+  subtle signal below threshold. A null at 70B requires **full-precision (fp16)
+  confirmation** before we report it as a genuine negative.
+
+Smaller rungs run at fp16/bf16 (unquantized), so this caveat applies only to the
+70B-class point.
