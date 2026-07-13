@@ -4,18 +4,16 @@
 > Reproduce concept-injection detection, then chart detection rate vs
 > parameter count across two model-size ladders.
 
-<!-- HERO: results/scaling-curve.png drops in here once the ladder run lands. -->
-> **Hero figure — the scaling curve — lands with the first ladder run.** It plots
-> detection-rate vs parameter count for both families, with the no-injection and
-> random-matched control bands. Until then the [architecture](#architecture)
-> diagram is the visual, and here is the earliest signal from the 0.5B pilot —
-> injecting an *oceans* vector bends the content even when the model can't yet
-> introspect on it:
->
-> ```text
-> concept = oceans  ·  Qwen2.5-0.5B-Instruct  ·  injected, seed 0
-> "Water quality is one of the darkest themes in conservation efforts today…"
-> ```
+![Detection rate vs parameter count — Qwen2.5-Instruct 0.5–32B. Injected-concept
+detection and both controls (no-injection, random-matched) sit at 0 across the
+whole ladder: no concept-injection introspection emerges at or below 32B.](results/scaling_curve.png)
+
+**First result:** across Qwen2.5-Instruct 0.5→32B, injected-concept detection is
+**0/216 at every rung — and so are both controls.** A clean null with clean
+controls (the [positive control](scripts/positive_control.py) confirms the judge
+*can* score a hit, so this is a real absence, not a dead instrument). See
+[RESULTS.md](RESULTS.md). 72B and the Llama-3.x family are pending; details and
+limitations there.
 
 ## The question
 Large models can sometimes *detect* when a concept has been injected into
