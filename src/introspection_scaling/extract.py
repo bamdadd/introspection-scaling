@@ -51,6 +51,7 @@ from repeng.extract import batched_get_hiddens  # type: ignore[import-untyped]
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
@@ -276,6 +277,52 @@ def build_dataset(concept: str, baseline_words: tuple[str, ...]) -> list[Dataset
     ]
 
 
+_TORCH_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def load_extraction_model(
+    model_id: str,
+    *,
+    dtype: str = "float32",
+    quant: str | None = None,
+    device: str = "cpu",
+) -> PreTrainedModel:
+    """Load a causal LM for extraction at the requested precision.
+
+    Shared contract with A2/A3: ``dtype`` in ``{"float32","float16","bfloat16"}``,
+    ``quant`` in ``{None, "nf4"}`` (bitsandbytes 4-bit nf4). CPU dev default is
+    ``float32``/``None``.
+
+    - ``quant="nf4"``: builds a ``BitsAndBytesConfig`` (4-bit nf4, double quant,
+      compute dtype = ``dtype``) and loads with ``device_map="auto"`` — needs a
+      GPU + bitsandbytes; placement is left to accelerate (no ``.to``).
+    - otherwise: loads with ``torch_dtype=dtype`` and moves to ``device``.
+    """
+    if dtype not in _TORCH_DTYPES:
+        raise ValueError(f"unknown dtype {dtype!r}; expected one of {sorted(_TORCH_DTYPES)}")
+    torch_dtype = _TORCH_DTYPES[dtype]
+
+    if quant is None:
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype)
+        # transformers' typed `.to` overload confuses mypy-strict; runtime is fine.
+        return model.to(torch.device(device))  # type: ignore[arg-type,no-any-return]
+    if quant == "nf4":
+        quant_config = BitsAndBytesConfig(  # type: ignore[no-untyped-call]
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch_dtype,
+        )
+        return AutoModelForCausalLM.from_pretrained(
+            model_id, quantization_config=quant_config, device_map="auto"
+        )
+    raise ValueError(f"unknown quant {quant!r}; expected None or 'nf4'")
+
+
 def extract_concept_vector(
     model_id: str,
     concept: str,
@@ -286,12 +333,21 @@ def extract_concept_vector(
     hidden_layers: list[int] | None = None,
     batch_size: int = 32,
     device: str = "cpu",
+    dtype: str = "float32",
+    quant: str | None = None,
 ) -> ConceptVector:
     """Extract a :class:`ConceptVector` for ``concept`` on ``model_id``.
 
     ``hidden_layers`` defaults to every block (``range(num_hidden_layers)``).
     ``model``/``tokenizer`` may be supplied to reuse a loaded model across
-    concepts; otherwise they are loaded on ``device`` in float32.
+    concepts; otherwise they are loaded via :func:`load_extraction_model`.
+
+    ``dtype`` (``"float32"|"float16"|"bfloat16"``) and ``quant``
+    (``None`` or ``"nf4"`` for bitsandbytes 4-bit) control the weight
+    precision — shared param names with A2/A3. CPU dev default is
+    ``float32``/``None``. The weight precision does NOT affect numerical
+    stability of the result: ``batched_get_hiddens`` casts hidden states to
+    float32, so the diff-of-means is always accumulated in float32.
 
     One forward pass over the contrast set (``batched_get_hiddens``); both the
     unit directions and ``raw_norms`` come from the same diff-of-means, so they
@@ -302,9 +358,7 @@ def extract_concept_vector(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if model is None:
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
-        # transformers' typed `.to` overload confuses mypy-strict; runtime is fine.
-        model = model.to(torch.device(device))  # type: ignore[arg-type]
+        model = load_extraction_model(model_id, dtype=dtype, quant=quant, device=device)
 
     if hidden_layers is None:
         hidden_layers = list(range(int(model.config.num_hidden_layers)))

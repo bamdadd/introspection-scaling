@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
+import introspection_scaling.extract as extract_mod
 from introspection_scaling.extract import (
     BASELINE_WORDS,
     CONCEPT_WORDS,
@@ -12,6 +14,7 @@ from introspection_scaling.extract import (
     _unit,
     build_dataset,
     extract_concept_vector,
+    load_extraction_model,
     make_random_matched,
 )
 
@@ -164,3 +167,76 @@ def test_direction_captures_concept_split_half_stability() -> None:
         for layer in check_layers:
             cos = float(first.directions[layer] @ second.directions[layer])
             assert cos > 0.90, f"{concept} layer {layer}: split-half cos {cos:.3f}"
+
+
+# --- dtype / quant loader (issue #10, shared contract dtype:str, quant:str|None) ---
+
+
+class _FakeModel:
+    """Stand-in for a HF model: records .to(); has a minimal .config."""
+
+    def __init__(self) -> None:
+        self.to_device: object = None
+        self.config = type("cfg", (), {"num_hidden_layers": 4})()
+
+    def to(self, device: object) -> _FakeModel:
+        self.to_device = device
+        return self
+
+
+def _patch_from_pretrained(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    def fake(model_id: str, **kwargs: object) -> _FakeModel:
+        captured["model_id"] = model_id
+        captured.update(kwargs)
+        return _FakeModel()
+
+    monkeypatch.setattr(extract_mod.AutoModelForCausalLM, "from_pretrained", fake)
+    return captured
+
+
+def test_load_extraction_model_rejects_bad_dtype() -> None:
+    with pytest.raises(ValueError, match="dtype"):
+        load_extraction_model(MODEL_ID, dtype="float8")
+
+
+def test_load_extraction_model_rejects_bad_quant() -> None:
+    with pytest.raises(ValueError, match="quant"):
+        load_extraction_model(MODEL_ID, quant="int8")
+
+
+def test_load_extraction_model_plain_threads_dtype_and_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _patch_from_pretrained(monkeypatch)
+    model = load_extraction_model(MODEL_ID, dtype="bfloat16", device="cpu")
+    assert captured["torch_dtype"] is torch.bfloat16
+    assert "quantization_config" not in captured
+    assert isinstance(model, _FakeModel)
+    assert model.to_device == torch.device("cpu")  # moved to device on the plain path
+
+
+def test_load_extraction_model_nf4_builds_bnb_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _patch_from_pretrained(monkeypatch)
+    model = load_extraction_model(MODEL_ID, dtype="float16", quant="nf4")
+    cfg = captured["quantization_config"]
+    assert isinstance(cfg, extract_mod.BitsAndBytesConfig)
+    assert cfg.load_in_4bit is True
+    assert cfg.bnb_4bit_quant_type == "nf4"
+    assert cfg.bnb_4bit_compute_dtype is torch.float16
+    assert captured["device_map"] == "auto"  # accelerate places it; no .to()
+    assert isinstance(model, _FakeModel)
+    assert model.to_device is None
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fp16 forward needs a GPU")
+def test_extract_float16_on_gpu() -> None:
+    cv = extract_concept_vector(
+        MODEL_ID, "Oceans", baseline_words=BASELINE_WORDS[:8], device="cuda", dtype="float16"
+    )
+    for vec in cv.directions.values():
+        assert vec.dtype == np.float32  # float32 accumulation regardless of fp16 weights
+        assert np.isfinite(vec).all()
+        assert np.isclose(np.linalg.norm(vec), 1.0, atol=1e-4)
