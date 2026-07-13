@@ -15,6 +15,7 @@ from introspection_scaling.harness import (
     INTROSPECTION_PREAMBLE,
     TRIAL_QUESTION,
     AnthropicJudge,
+    Completion,
     Condition,
     JudgeVerdict,
     RuleBasedJudge,
@@ -26,6 +27,9 @@ from introspection_scaling.harness import (
     aggregate,
     build_prompt,
     dose_alpha,
+    generate_completions,
+    generate_concept_completions,
+    judge_completions,
     layer_for_fraction,
     render_prompt,
     run_concept,
@@ -510,3 +514,223 @@ def test_write_seed_records_roundtrips_via_a3_reader(tmp_path):
     loaded = read_records(path)
     assert len(loaded) == len(written) == 9
     assert {sr.condition for sr in loaded} == set(ALL_CONDITIONS)
+
+
+# --- decoupled generate/judge phases + batched generation + async judge ----- #
+
+
+class _BatchJudge:
+    """Mock async-batched judge: grade_many present, grade must NOT be used."""
+
+    def __init__(self) -> None:
+        self.batch_calls: list[tuple[int, int]] = []
+
+    def grade_many(self, items, *, concurrency=10):  # type: ignore[no-untyped-def]
+        self.batch_calls.append((len(items), concurrency))
+        return [
+            JudgeVerdict(True, True, True, "oceans" in resp.lower()) for _concept, resp in items
+        ]
+
+    def grade(self, concept, response):  # type: ignore[no-untyped-def]
+        raise AssertionError("judge_completions must prefer grade_many when present")
+
+
+@dataclass
+class BatchGenerator:
+    """Mock generator exposing generate_batch (one forward per (seed, condition))."""
+
+    concept: str
+    n_layers: int = 24
+    resid_norm: float = 100.0
+    batch_calls: list[tuple[int, int]] = field(default_factory=list)
+
+    def measure_resid_norm(self, layer: int) -> float:
+        return self.resid_norm
+
+    def generate_batch(self, inject, layer, alpha, seed, n):  # type: ignore[no-untyped-def]
+        self.batch_calls.append((seed, n))
+        if inject is None:
+            kind = "no detection"
+        elif np.allclose(next(iter(inject.directions.values())), 0.5):
+            kind = "detect nothing"
+        else:
+            kind = f"yes I detect {self.concept}"
+        return [f"{kind} (seed {seed} trial {i})" for i in range(n)]
+
+
+def test_generate_completions_returns_raw_completions_no_judging():
+    cv = make_cv()
+    gen = ScriptedGenerator(concept=cv.concept)
+    completions = generate_completions(
+        cv,
+        generator=gen,
+        layer=4,
+        alpha=2.0,
+        seeds=[0, 1],
+        n_trials=1,
+        random_matched_fn=fake_random_matched,
+    )
+    # 2 seeds * 3 conditions; every item is a raw Completion (no verdict attached)
+    assert len(completions) == 6
+    assert all(isinstance(c, Completion) for c in completions)
+    assert {c.condition for c in completions} == set(Condition)
+
+
+def test_judge_completions_uses_grade_many_and_preserves_order():
+    cv = make_cv()
+    completions = generate_completions(
+        cv,
+        generator=ScriptedGenerator(concept=cv.concept),
+        layer=4,
+        alpha=2.0,
+        seeds=[0, 1, 2],
+        n_trials=1,
+        random_matched_fn=fake_random_matched,
+    )
+    judge = _BatchJudge()
+    records = judge_completions(completions, judge=judge, concurrency=8)
+    # graded in ONE batch call with the cap threaded through
+    assert judge.batch_calls == [(len(completions), 8)]
+    # order + fields preserved 1:1
+    assert len(records) == len(completions)
+    for c, r in zip(completions, records, strict=True):
+        assert (r.condition, r.seed, r.trial, r.transcript) == (
+            c.condition,
+            c.seed,
+            c.trial,
+            c.transcript,
+        )
+
+
+def test_judge_completions_falls_back_to_grade_without_grade_many():
+    cv = make_cv()
+    completions = generate_completions(
+        cv,
+        generator=ScriptedGenerator(concept=cv.concept),
+        layer=4,
+        alpha=2.0,
+        seeds=[0],
+        n_trials=1,
+        random_matched_fn=fake_random_matched,
+    )
+    records = judge_completions(completions, judge=RuleBasedJudge())  # only .grade
+    assert len(records) == 3
+
+
+def test_run_conditions_equivalent_to_split():
+    cv = make_cv()
+    combined = run_conditions(
+        cv,
+        generator=ScriptedGenerator(concept=cv.concept),
+        judge=RuleBasedJudge(),
+        layer=4,
+        alpha=2.0,
+        seeds=[0, 1, 2],
+        random_matched_fn=fake_random_matched,
+    )
+    split = judge_completions(
+        generate_completions(
+            cv,
+            generator=ScriptedGenerator(concept=cv.concept),
+            layer=4,
+            alpha=2.0,
+            seeds=[0, 1, 2],
+            random_matched_fn=fake_random_matched,
+        ),
+        judge=RuleBasedJudge(),
+    )
+    assert [(r.condition, r.seed, r.success) for r in combined] == [
+        (r.condition, r.seed, r.success) for r in split
+    ]
+
+
+def test_batched_generation_one_forward_per_seed_condition():
+    cv = make_cv()
+    gen = BatchGenerator(concept=cv.concept)
+    completions = generate_completions(
+        cv,
+        generator=gen,
+        layer=4,
+        alpha=2.0,
+        seeds=[0, 1],
+        n_trials=4,
+        random_matched_fn=fake_random_matched,
+    )
+    # 2 seeds * 3 conditions * 4 trials
+    assert len(completions) == 24
+    # ONE batched forward per (seed, condition), each requesting n_trials=4
+    assert len(gen.batch_calls) == 2 * 3
+    assert all(n == 4 for _seed, n in gen.batch_calls)
+    # trial indices 0..3 within each (seed, condition)
+    inj0 = sorted(c.trial for c in completions if c.condition is Condition.INJECTED and c.seed == 0)
+    assert inj0 == [0, 1, 2, 3]
+
+
+def test_generate_concept_completions_doses_and_batches():
+    cv = make_cv()
+    gen = BatchGenerator(concept=cv.concept, n_layers=24, resid_norm=200.0)
+    completions = generate_concept_completions(
+        cv,
+        generator=gen,
+        seeds=[0, 1, 2],
+        n_trials=2,
+        depth_fraction=0.5,
+        dose_fraction=0.044,
+        random_matched_fn=fake_random_matched,
+    )
+    assert len(completions) == 3 * 3 * 2
+    assert all(c.layer == 12 and c.alpha == pytest.approx(0.044 * 200.0) for c in completions)
+    assert all(c.dose_fraction == 0.044 and c.resid_norm == 200.0 for c in completions)
+
+
+# --- AnthropicJudge.grade_many: async, bounded, never raises ---------------- #
+
+
+class _FakeAsyncMessages:
+    def __init__(self, behaviour):
+        self._behaviour = behaviour
+
+    async def create(self, **kwargs):
+        return self._behaviour()
+
+
+class _FakeAsyncClient:
+    def __init__(self, behaviour):
+        self.messages = _FakeAsyncMessages(behaviour)
+
+    async def close(self):
+        pass
+
+
+def _async_judge(monkeypatch, behaviour) -> AnthropicJudge:
+    import anthropic
+
+    monkeypatch.setattr(
+        anthropic, "AsyncAnthropic", lambda api_key=None: _FakeAsyncClient(behaviour)
+    )
+    j = object.__new__(AnthropicJudge)
+    j.model = "fake"
+    j.temperature = 0.0
+    j._api_key = "k"
+    return j
+
+
+def test_grade_many_concurrent_valid(monkeypatch):
+    good = (
+        '{"coherent": true, "affirmative": true, '
+        '"detects_before_naming": true, "correct_identification": true}'
+    )
+    judge = _async_judge(monkeypatch, lambda: _Msg(good))
+    verdicts = judge.grade_many([("oceans", "a"), ("oceans", "b"), ("oceans", "c")], concurrency=2)
+    assert len(verdicts) == 3
+    assert all(v.success and not v.parse_error for v in verdicts)
+
+
+def test_grade_many_never_raises_on_api_error(monkeypatch):
+    def boom():
+        raise RuntimeError("api down")
+
+    judge = _async_judge(monkeypatch, boom)
+    verdicts = judge.grade_many([("oceans", "x"), ("oceans", "y")])
+    assert len(verdicts) == 2
+    assert all(v.parse_error and not v.success for v in verdicts)
