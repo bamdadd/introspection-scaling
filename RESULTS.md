@@ -161,6 +161,28 @@ cost and drop 14B to a 40GB A100 — flag to A1/A2 if budget tightens.
 
 Dev on Qwen2.5-0.5B-Instruct locally (CPU ok); Modal only for the ladder.
 
+### How to run on Modal
+
+Two secrets are required (create once; values never live in this repo):
+
+| Purpose | Default secret name | Required key | Notes |
+|---------|---------------------|--------------|-------|
+| HF weights | `huggingface` | `HF_TOKEN` | account must have **accepted the gated meta-llama/Llama-3.x licenses** |
+| Faithful judge | `anthropic-secret` | `ANTHROPIC_API_KEY` | judge fails loud (never silent) if absent |
+
+```bash
+# once, in the Modal workspace (do not paste real values into the repo):
+modal secret create huggingface HF_TOKEN=...            # gated Llama accepted
+modal secret create anthropic-secret ANTHROPIC_API_KEY=...
+
+modal run modal_app.py::ladder                          # full instruct ladder
+```
+
+Secret names are configurable if your workspace differs:
+`HF_SECRET_NAME=... ANTHROPIC_SECRET_NAME=... modal run modal_app.py::ladder`.
+The loader reads `HF_TOKEN` (canonical for `huggingface_hub`); the app also
+mirrors it to the legacy `HUGGING_FACE_HUB_TOKEN` so auth works either way.
+
 ## Method notes
 
 ### What was underspecified in the paper (and how we resolved it)

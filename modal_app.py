@@ -15,14 +15,24 @@ Two entrypoints:
   extract (A1) + inject/judge (A2) across the instruct ladder, writing
   ``SeedRecord`` JSONL to a Modal Volume. Sized **A100-80GB** because both
   extraction and the ControlModel hold the model in float32 (14B fp32 ≈ 56 GB;
-  see ``runner.run_ladder`` two-phase docs). **Blocked on A2 harness landing on
-  main** (pinned agent2 ``49cc0ee``); the wiring is complete and unit-tested.
+  see ``runner.run_ladder`` two-phase docs).
+
+Required Modal secrets (create once; values never live in this repo). Names are
+configurable via ``HF_SECRET_NAME`` / ``ANTHROPIC_SECRET_NAME`` — defaults match
+the current workspace (``huggingface`` + ``anthropic-secret``):
+
+* HF secret (default name ``huggingface``) must expose ``HF_TOKEN``, on an
+  account that has **accepted the gated meta-llama/Llama-3.x licenses**.
+* Anthropic secret (default name ``anthropic-secret``) must expose
+  ``ANTHROPIC_API_KEY`` for the faithful judge.
 
 Pinned (from uv.lock at commit time): torch 2.13.0 (CUDA), transformers 5.13.1,
 modal 1.5.2. Python 3.11. Base: modal debian_slim.
 """
 
 from __future__ import annotations
+
+import os
 
 import modal
 
@@ -83,7 +93,7 @@ def smoke(model_id: str = SMOKE_MODEL) -> dict[str, object]:
 
 
 # --------------------------------------------------------------------------- #
-# Full ladder sweep (blocked on A2 harness on main; wiring complete + tested).
+# Full ladder sweep. Needs the two Modal secrets above; run with `modal run`.
 # --------------------------------------------------------------------------- #
 
 # The sweep needs our package (extract + harness + runner). Mount it into the
@@ -94,12 +104,19 @@ _ladder_image = image.add_local_python_source("introspection_scaling")
 _results_vol = modal.Volume.from_name("introspection-results", create_if_missing=True)
 _RESULTS_DIR = "/results"
 
-# Secrets (create once in the Modal workspace; see README/RESULTS):
-#   modal secret create huggingface-secret HF_TOKEN=...        (Llama is gated)
-#   modal secret create anthropic-secret ANTHROPIC_API_KEY=... (faithful judge)
+# Secret NAMES are configurable so we are not hard-locked to one workspace's
+# naming. Defaults match what the workspace actually has today: an HF secret
+# named "huggingface" and an Anthropic secret named "anthropic-secret".
+# Override per-run, e.g.:  HF_SECRET_NAME=my-hf ANTHROPIC_SECRET_NAME=my-anthropic
+# Required KEYS inside the secrets (values never live in this repo):
+#   HF secret        -> HF_TOKEN         (account must have accepted the GATED
+#                                          meta-llama/Llama-3.x licenses)
+#   Anthropic secret -> ANTHROPIC_API_KEY (faithful judge; fails loud if absent)
+HF_SECRET_NAME = os.environ.get("HF_SECRET_NAME", "huggingface")
+ANTHROPIC_SECRET_NAME = os.environ.get("ANTHROPIC_SECRET_NAME", "anthropic-secret")
 _SECRETS = [
-    modal.Secret.from_name("huggingface-secret"),
-    modal.Secret.from_name("anthropic-secret"),
+    modal.Secret.from_name(HF_SECRET_NAME),
+    modal.Secret.from_name(ANTHROPIC_SECRET_NAME),
 ]
 
 # Instruct ladder (chat self-report — base models can't follow the protocol).
@@ -133,13 +150,16 @@ def run_ladder(
     """Run the ladder sweep on GPU and persist ``records.jsonl`` to the volume.
 
     Delegates all science to ``runner.run_ladder`` (A1 extract + A2 harness); the
-    faithful Anthropic judge is used (``anthropic-secret``) — no silent fallback.
+    faithful Anthropic judge is used (needs ``ANTHROPIC_API_KEY`` from the
+    Anthropic secret) — no silent fallback.
     """
-    import os
-
     from introspection_scaling.runner import run_ladder as _run
 
     os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    # huggingface_hub reads HF_TOKEN (canonical) for gated Llama pulls; alias the
+    # legacy name so auth works regardless of which the loader/version checks.
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
     out = f"{_RESULTS_DIR}/records.jsonl"
     records = _run(
         models,
