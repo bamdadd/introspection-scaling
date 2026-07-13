@@ -565,6 +565,12 @@ class RepengGenerator:
                 max_new_tokens=self.max_new_tokens,
                 do_sample=True,
                 temperature=self.temperature,
+                # Pin PURE temperature sampling: many ladder models ship a
+                # truncating top_p/top_k in generation_config.json, which would
+                # make the rate a truncated-temperature measurement, not the
+                # temperature-1 the SPEC requires. Override explicitly.
+                top_p=1.0,
+                top_k=0,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
             new_tokens = out[0, enc["input_ids"].shape[1] :]
