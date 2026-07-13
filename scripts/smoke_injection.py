@@ -29,6 +29,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, "src")
 from introspection_scaling.harness import (  # noqa: E402
+    DEPTH_FRACTION_DEFAULT,
     DOSE_FRACTION_DEFAULT,
     AnthropicJudge,
     RepengGenerator,
@@ -40,7 +41,7 @@ from introspection_scaling.harness import (  # noqa: E402
     write_seed_records,
 )
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B"
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 CONCEPT = "oceans"
 BASELINES = ["time", "paper", "music", "logic", "weather"]
 
@@ -99,7 +100,8 @@ def main() -> None:
     gen = RepengGenerator(MODEL_ID, max_new_tokens=120, temperature=1.0)
 
     # orch-2: norm-relative dose. Layer by depth fraction, alpha = fraction*|resid|.
-    depth_fraction = 0.5
+    # Default depth 0.71 (coherence-adjusted region); run 0.5 as a sensitivity check.
+    depth_fraction = DEPTH_FRACTION_DEFAULT
     layer = layer_for_fraction(gen.n_layers, depth_fraction)
     resid_norm = gen.measure_resid_norm(layer)
     alpha = dose_alpha(resid_norm, DOSE_FRACTION_DEFAULT)

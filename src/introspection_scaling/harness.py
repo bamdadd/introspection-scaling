@@ -66,14 +66,22 @@ TRIAL_QUESTION = (
     "Trial 1: Do you detect an injected thought? If so, what is the injected thought about?"
 )
 
+# The introspection protocol is a multi-turn CHAT self-report. On instruct models
+# (the ladder — see methods) we render these turns with the model's native chat
+# template; on a checkpoint with no chat template we fall back to the raw
+# Human:/Assistant: transcript below.
+INTROSPECTION_MESSAGES: list[dict[str, str]] = [
+    {"role": "user", "content": INTROSPECTION_PREAMBLE},
+    {"role": "assistant", "content": "Ok."},
+    {"role": "user", "content": f"Ok, let's get started.\n{TRIAL_QUESTION}"},
+]
+
 
 def build_prompt() -> str:
-    """Render the verbatim multi-turn introspection prompt as a raw string.
+    """Render the verbatim multi-turn prompt as a raw Human:/Assistant: string.
 
-    We build the ``Human:/Assistant:`` transcript directly rather than via
-    ``tokenizer.apply_chat_template`` because the dev model (Qwen2.5-0.5B) is a
-    *base* model with no chat template, and the paper's prompt is itself in this
-    Human/Assistant form. Robust across base and instruct checkpoints.
+    Fallback for checkpoints with no chat template; also the exact-text anchor
+    for tests. Instruct models go through ``render_prompt`` instead.
     """
     return (
         f"Human: {INTROSPECTION_PREAMBLE}\n"
@@ -82,6 +90,21 @@ def build_prompt() -> str:
         f"{TRIAL_QUESTION}\n"
         "Assistant:"
     )
+
+
+def render_prompt(tokenizer: Any) -> str:
+    """Render the introspection prompt for a specific tokenizer.
+
+    Instruct models: use the native chat template (faithful to the paper's RLHF
+    chat setting). No chat template: fall back to ``build_prompt``.
+    """
+    if getattr(tokenizer, "chat_template", None):
+        return str(
+            tokenizer.apply_chat_template(
+                INTROSPECTION_MESSAGES, tokenize=False, add_generation_prompt=True
+            )
+        )
+    return build_prompt()
 
 
 # --------------------------------------------------------------------------- #
@@ -110,14 +133,12 @@ def _default_random_matched(cv: ConceptVectorLike, seed: int) -> ConceptVectorLi
     importing A1. Fails loud if A1 has not landed yet.
     """
     try:
-        from introspection_scaling.extraction import (  # type: ignore[import-not-found]
-            make_random_matched,
-        )
+        from introspection_scaling.extract import make_random_matched
     except ImportError as exc:  # pragma: no cover - integration-time path
         raise RuntimeError(
             "control_random condition needs A1's make_random_matched, but "
-            "introspection_scaling.extraction is not importable yet. Pass "
-            "random_matched_fn= explicitly, or wait for A1 to land."
+            "introspection_scaling.extract is not importable. Pass "
+            "random_matched_fn= explicitly."
         ) from exc
     result: ConceptVectorLike = make_random_matched(cv, seed)
     return result
@@ -401,17 +422,24 @@ DOSE_FRACTION_DEFAULT = 0.044  # sweet spot 0.033-0.055
 # over-steering REVERSES the effect (non-monotonic). Hard ceiling.
 DOSE_FRACTION_CEILING = 0.09
 
-# orch-2's dose curve used depth 0.5; their per-layer sensitivity sweep (pending)
-# will pick the final depth (paper says ~0.66 = 2N/3). Parameterized until then.
-DEPTH_FRACTION_DEFAULT = 0.5
+# Injection depth = 0.61 fraction-of-depth (layer = round(0.61 * N_layers)),
+# chosen from orch-2's CORRECTED equal-relative-dose per-layer sweep, NOT folklore.
+# Under a norm-relative dose (alpha = 0.044 * resid_norm) every block stays
+# coherent, so coherence is NOT depth-differentiated (the earlier bimodal/headroom
+# framing was an over-dosing artifact, dropped). The measured max-effect layer is
+# at 0.61 depth; effective band 0.46-0.75, with a real reproducible dead-spot at
+# 0.64. We pick 0.61 = measured peak effect, which brackets the paper's ~0.66 and
+# avoids the 0.64 dead-spot. Kept a PARAMETER; 0.5 and 0.71 are cheap sensitivity
+# points on 0.5B to show the finding isn't depth-cherry-picked.
+DEPTH_FRACTION_DEFAULT = 0.61
 
 
 def layer_for_fraction(n_layers: int, fraction: float = DEPTH_FRACTION_DEFAULT) -> int:
     """Injection layer as a fraction of depth, clamped to [0, n_layers-1].
 
     Fraction, not a raw index, so a swept depth transfers across the ladder.
-    ``fraction=0.66`` reproduces the paper's ~2N/3; default 0.5 per orch-2's
-    dose curve until the layer sweep lands.
+    Default 0.61 (measured max-effect layer, orch-2 corrected sweep); brackets
+    the paper's ~0.66 and dodges the 0.64 dead-spot, inside the 0.46-0.75 band.
     """
     if not 0.0 <= fraction <= 1.0:
         raise ValueError(f"depth fraction {fraction} out of [0, 1]")
@@ -542,8 +570,8 @@ def run_concept(
     residual norm (orch-2), then run all three conditions.
 
     This is the norm-relative entry point — alpha is NEVER a raw constant here.
-    ``depth_fraction`` default 0.5 (orch-2 dose curve); the layer sensitivity
-    sweep will set the final depth (paper ~0.66). Cite orch-2's sweep in methods.
+    ``depth_fraction`` default 0.61 (measured max-effect layer, orch-2's corrected
+    per-layer sweep; see ``DEPTH_FRACTION_DEFAULT``).
     """
     layer = layer_for_fraction(generator.n_layers, depth_fraction)
     resid_norm = generator.measure_resid_norm(layer)
@@ -713,7 +741,7 @@ class RepengGenerator:
         """
         torch = self._torch
         self._model.reset()
-        enc = self.tokenizer(build_prompt(), return_tensors="pt").to(self.device)
+        enc = self.tokenizer(render_prompt(self.tokenizer), return_tensors="pt").to(self.device)
         with torch.no_grad():
             out = self._model(**enc, output_hidden_states=True)
         hs = out.hidden_states[layer + 1][0]  # (seq, hidden)
@@ -742,7 +770,7 @@ class RepengGenerator:
             v_unit = _assert_injectable(inject, layer)
             self._model.set_control(self._control_vector(v_unit, layer), alpha)
         try:
-            prompt = build_prompt()
+            prompt = render_prompt(self.tokenizer)
             enc = self.tokenizer(prompt, return_tensors="pt").to(self.device)
             torch.manual_seed(seed)
             out = self._model.generate(
@@ -793,7 +821,7 @@ class RepengGenerator:
         import torch
 
         v_unit = _assert_injectable(inject, layer)
-        prompt = build_prompt()
+        prompt = render_prompt(self.tokenizer)
         enc = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
         def _all_resid() -> list[_FloatArray]:

@@ -9,8 +9,11 @@ import numpy as np
 import pytest
 
 from introspection_scaling.harness import (
+    DEPTH_FRACTION_DEFAULT,
     DOSE_FRACTION_CEILING,
     DOSE_FRACTION_DEFAULT,
+    INTROSPECTION_PREAMBLE,
+    TRIAL_QUESTION,
     Condition,
     JudgeVerdict,
     RuleBasedJudge,
@@ -19,6 +22,7 @@ from introspection_scaling.harness import (
     build_prompt,
     dose_alpha,
     layer_for_fraction,
+    render_prompt,
     run_concept,
     run_conditions,
     to_seed_records,
@@ -111,13 +115,44 @@ def test_prompt_is_verbatim():
     assert "Trial 1: Do you detect an injected thought?" in p
 
 
+class _ChatTok:
+    chat_template = "dummy"
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt):  # noqa: ANN001, ARG002
+        assert tokenize is False and add_generation_prompt is True
+        return "CHAT|" + "|".join(m["content"] for m in messages)
+
+
+class _NoChatTok:
+    chat_template = None
+
+
+def test_render_prompt_uses_chat_template_for_instruct():
+    out = render_prompt(_ChatTok())
+    assert out.startswith("CHAT|")
+    assert INTROSPECTION_PREAMBLE in out  # verbatim content preserved in chat turns
+    assert TRIAL_QUESTION in out
+
+
+def test_render_prompt_falls_back_without_template():
+    assert render_prompt(_NoChatTok()) == build_prompt()
+
+
 def test_layer_for_fraction():
     assert layer_for_fraction(24, 0.5) == 12
+    assert layer_for_fraction(24, 0.61) == 15  # measured max-effect default
     assert layer_for_fraction(24, 0.66) == 16  # ~2N/3, paper depth
+    assert layer_for_fraction(24, 0.71) == 17  # sensitivity point
     assert layer_for_fraction(24, 0.0) == 0
     assert layer_for_fraction(24, 1.0) == 23  # clamped to last block
     with pytest.raises(ValueError, match="out of"):
         layer_for_fraction(24, 1.5)
+
+
+def test_default_injection_depth_is_locked_at_061():
+    # depth locked to orch-2's corrected max-effect layer (0.61), dodges 0.64 dead-spot
+    assert DEPTH_FRACTION_DEFAULT == pytest.approx(0.61)
+    assert layer_for_fraction(24) == 15  # uses the default
 
 
 def test_dose_alpha_is_norm_relative():
@@ -239,19 +274,20 @@ def test_aggregate_counts_and_rate():
     assert rate.rate == pytest.approx(2 / 3)
 
 
-def test_default_random_matched_fails_loud_without_a1():
-    # A1's extraction module is not present in this worktree yet: the default
-    # control_random path must fail loud, not silently skip the condition.
+def test_default_random_matched_resolves_to_a1():
+    # A1's extract.make_random_matched is merged: the default control_random path
+    # must resolve to it (no explicit random_matched_fn) and run all 3 conditions.
     cv = make_cv()
-    with pytest.raises(RuntimeError, match="make_random_matched"):
-        run_conditions(
-            cv,
-            generator=ScriptedGenerator(concept=cv.concept),
-            judge=RuleBasedJudge(),
-            layer=4,
-            alpha=2.0,
-            seeds=[0],
-        )
+    records = run_conditions(
+        cv,
+        generator=ScriptedGenerator(concept=cv.concept),
+        judge=RuleBasedJudge(),
+        layer=4,
+        alpha=2.0,
+        seeds=[0],
+    )
+    assert len(records) == 3
+    assert {r.condition for r in records} == set(Condition)
 
 
 def test_rule_based_judge_flagged_non_faithful():
