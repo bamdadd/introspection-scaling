@@ -17,15 +17,12 @@ vectors first (they're tiny), free the model, then build the generator — peak
 ≈ 56 GB, fits an A100-80GB. This is why the Modal ladder is sized 80GB.
 
 **Injection parameters (orch-2):** depth fraction **0.61**, dose fraction
-**0.044** (α = 0.044 · measured residual-stream norm). Threaded explicitly —
-never the harness defaults (which are 0.5 / 0.044).
+**0.044** (α = 0.044 · measured residual-stream norm). Threaded explicitly.
 
-**Dependency-injected seam.** The A2 harness (`introspection_scaling.harness`,
-pinned agent2 ``49cc0ee``) is not yet merged to main, so it is resolved at call
-time (not a static import) and every collaborator is an injectable parameter.
-The orchestration therefore imports, type-checks, and unit-tests standalone with
-fakes; the real end-to-end integration runs once harness is on the path. A1's
-`extract` IS on main and is imported statically.
+**Dependency-injected seam.** The real A1 (`extract`) and A2 (`harness`) callables
+are the defaults; every collaborator is also an injectable parameter, so the
+orchestration unit-tests with fakes (no models / GPU) while production wires the
+live `extract_concept_vector` + `run_concept` + `write_seed_records`.
 """
 
 from __future__ import annotations
@@ -39,6 +36,14 @@ from .extract import (
     ConceptVector,
     extract_concept_vector,
     make_random_matched,
+)
+from .harness import (
+    AnthropicJudge,
+    MissingJudgeCredentialsError,
+    RepengGenerator,
+    RuleBasedJudge,
+    run_concept,
+    write_seed_records,
 )
 from .records import SeedRecord
 
@@ -69,33 +74,15 @@ class JudgeLike(Protocol):
     def grade(self, concept: str, response: str) -> Any: ...
 
 
-# Injected collaborators (defaults resolve the real A1/A2 code lazily).
+# Injected collaborators (defaults are the real A1/A2 callables).
 GeneratorFactory = Callable[[str], DoseGeneratorLike]
-RunConceptFn = Callable[..., list[Any]]
-WriteFn = Callable[[Sequence[Any], str | Path], list[SeedRecord]]
+RunConceptFn = Callable[..., Any]
+WriteFn = Callable[..., list[SeedRecord]]
 ExtractFn = Callable[..., ConceptVector]
 
 
-def _harness() -> Any:
-    """Resolve the A2 harness at call time (it is not a static dependency).
-
-    Fails loud with an actionable message if harness is not yet on the path —
-    aggregate/plot still work standalone, only the sweep needs it.
-    """
-    import importlib
-
-    try:
-        return importlib.import_module("introspection_scaling.harness")
-    except ModuleNotFoundError as exc:  # pragma: no cover - trivial guard
-        raise RuntimeError(
-            "ladder runner needs introspection_scaling.harness (A2, pinned agent2 "
-            "49cc0ee) importable. It is not yet merged to main — merge wt/agent2 "
-            "first. report.py aggregate/plot work without it."
-        ) from exc
-
-
 def _default_generator(model_id: str, *, device: str) -> DoseGeneratorLike:
-    gen: DoseGeneratorLike = _harness().RepengGenerator(model_id, device=device)
+    gen: DoseGeneratorLike = RepengGenerator(model_id, device=device)
     return gen
 
 
@@ -104,14 +91,13 @@ def _resolve_judge(judge: JudgeLike | None, *, allow_rule_based: bool) -> JudgeL
     caller explicitly opts in (SPEC: never grade silently with a fallback)."""
     if judge is not None:
         return judge
-    h = _harness()
     try:
-        anthropic_judge: JudgeLike = h.AnthropicJudge()
+        anthropic_judge: JudgeLike = AnthropicJudge()
         return anthropic_judge
-    except h.MissingJudgeCredentialsError:
+    except MissingJudgeCredentialsError:
         if not allow_rule_based:
             raise
-        rule_judge: JudgeLike = h.RuleBasedJudge()
+        rule_judge: JudgeLike = RuleBasedJudge()
         return rule_judge
 
 
@@ -155,11 +141,11 @@ def run_ladder(
     device: str = "cpu",
     judge: JudgeLike | None = None,
     allow_rule_based_judge: bool = False,
-    # Injected seams — defaults resolve real A1/A2 code (see module docstring).
+    # Injected seams — defaults are the real A1/A2 callables (see module docstring).
     extract_fn: ExtractFn = extract_concept_vector,
     make_generator: GeneratorFactory | None = None,
-    run_concept_fn: RunConceptFn | None = None,
-    write_seed_records_fn: WriteFn | None = None,
+    run_concept_fn: RunConceptFn = run_concept,
+    write_seed_records_fn: WriteFn = write_seed_records,
     random_matched_fn: Callable[[ConceptVector, int], ConceptVector] = make_random_matched,
     load_model_fn: Callable[[str, str], tuple[Any, Any]] = _load_causal_lm,
 ) -> list[SeedRecord]:
@@ -173,22 +159,10 @@ def run_ladder(
     def _default_gen(model_id: str) -> DoseGeneratorLike:
         return _default_generator(model_id, device=device)
 
-    # Resolve collaborators; only touch the (possibly-unmerged) harness when a
-    # real default is actually needed, so tests with fakes never import it.
     gen_factory: GeneratorFactory = make_generator if make_generator is not None else _default_gen
-    rc_fn: RunConceptFn
-    resolved_judge: JudgeLike | None
-    if run_concept_fn is None:
-        rc_fn = _harness().run_concept
-        resolved_judge = _resolve_judge(judge, allow_rule_based=allow_rule_based_judge)
-    else:
-        rc_fn = run_concept_fn
-        resolved_judge = judge
-    write_fn: WriteFn = (
-        write_seed_records_fn
-        if write_seed_records_fn is not None
-        else _harness().write_seed_records
-    )
+    resolved_judge = _resolve_judge(judge, allow_rule_based=allow_rule_based_judge)
+    rc_fn = run_concept_fn
+    write_fn = write_seed_records_fn
 
     all_trials: list[Any] = []
     for model_id in models:

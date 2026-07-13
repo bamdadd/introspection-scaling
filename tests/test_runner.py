@@ -147,19 +147,3 @@ def test_cli_seam_threads_args(monkeypatch, tmp_path: Path) -> None:
     assert captured["out_path"] == out
     assert captured["depth_fraction"] == pytest.approx(0.61)
     assert captured["dose_fraction"] == pytest.approx(0.044)
-
-
-def test_missing_harness_fails_loud(tmp_path: Path) -> None:
-    # No run_concept_fn injected -> resolves the (unmerged) harness -> clear error.
-    with pytest.raises(RuntimeError, match="harness"):
-        run_ladder(
-            _MODELS,
-            concepts=_CONCEPTS,
-            seeds=[0, 1, 2],
-            n_trials=1,
-            out_path=tmp_path / "r.jsonl",
-            judge=object(),
-            extract_fn=_Recorder().extract,
-            make_generator=_Recorder().make_generator,
-            load_model_fn=_Recorder().load_model,
-        )
