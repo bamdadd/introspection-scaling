@@ -27,7 +27,9 @@ live `extract_concept_vector` + `run_concept` + `write_seed_records`.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -54,6 +56,14 @@ if TYPE_CHECKING:
 DEPTH_FRACTION = 0.61
 DOSE_FRACTION = 0.044
 
+#: model_id -> (dtype, quant). dtype ∈ {float16, bfloat16, float32}; quant ∈
+#: {None, "nf4"}. This is the SHARED CONTRACT threaded to A1 `extract` (via the
+#: extraction model load, which A3 owns) and A2 `RepengGenerator` (which A2 must
+#: teach to accept ``dtype`` / ``quant`` — pending). Default per model is
+#: ("float32", None), preserving prior behaviour when no map is given.
+PrecisionMap = Mapping[str, "tuple[str, str | None]"]
+_DEFAULT_PRECISION: tuple[str, str | None] = ("float32", None)
+
 
 @runtime_checkable
 class DoseGeneratorLike(Protocol):
@@ -75,14 +85,45 @@ class JudgeLike(Protocol):
 
 
 # Injected collaborators (defaults are the real A1/A2 callables).
-GeneratorFactory = Callable[[str], DoseGeneratorLike]
+# GeneratorFactory takes (model_id, dtype, quant) so precision is per model.
+GeneratorFactory = Callable[[str, str, "str | None"], DoseGeneratorLike]
 RunConceptFn = Callable[..., Any]
 WriteFn = Callable[..., list[SeedRecord]]
 ExtractFn = Callable[..., ConceptVector]
 
 
-def _default_generator(model_id: str, *, device: str) -> DoseGeneratorLike:
-    gen: DoseGeneratorLike = RepengGenerator(model_id, device=device)
+@dataclass
+class LadderRun:
+    """Outcome of :func:`run_ladder` — enough to report a partial curve honestly."""
+
+    records: list[SeedRecord]
+    ran: list[str] = field(default_factory=list)  # models completed
+    skipped: list[str] = field(default_factory=list)  # models not started (cost stop)
+    stopped_reason: str | None = None  # set iff the cost guard tripped
+    spent_usd: float = 0.0  # measured GPU $ at the pinned rate
+
+
+def _default_generator(
+    model_id: str, dtype: str, quant: str | None, *, device: str
+) -> DoseGeneratorLike:
+    """Build A2's RepengGenerator at the requested precision.
+
+    Fails LOUD if RepengGenerator does not yet accept ``dtype`` / ``quant`` — the
+    SHARED CONTRACT is pending on A2. No silent fp32 fallback: fp32 OOMs 32B on an
+    80 GB A100 and violates the fp16 policy, so a silent downgrade is worse than a
+    clear stop.
+    """
+    # A2 must teach RepengGenerator to accept dtype/quant (SHARED CONTRACT, pending);
+    # call through an Any ref until then, and fail loud below if it doesn't.
+    gen_cls: Any = RepengGenerator
+    try:
+        gen: DoseGeneratorLike = gen_cls(model_id, device=device, dtype=dtype, quant=quant)
+    except TypeError as exc:
+        raise RuntimeError(
+            "RepengGenerator does not accept dtype/quant yet — A2 must implement "
+            "the SHARED CONTRACT (RepengGenerator(..., *, dtype: str, quant: str|None)). "
+            "Refusing to run: fp32 OOMs 32B on an 80GB A100 and breaks the fp16 policy."
+        ) from exc
     return gen
 
 
@@ -101,20 +142,54 @@ def _resolve_judge(judge: JudgeLike | None, *, allow_rule_based: bool) -> JudgeL
         return rule_judge
 
 
-def _load_causal_lm(model_id: str, device: str) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
-    """Load once per model for extraction (float32, matching A1/A2).
+def _load_causal_lm(
+    model_id: str, device: str, dtype: str = "float32", quant: str | None = None
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    """Load once per model for extraction at the requested precision (A3 owns this).
 
-    Loading here (rather than letting ``extract_concept_vector`` load per
-    concept) means one model load per model, and lets us free it before the
-    generator is built — the two-phase memory contract.
+    Loading here (rather than letting ``extract_concept_vector`` load per concept)
+    means one model load per model, and lets us free it before the generator is
+    built — the two-phase memory contract. ``extract_concept_vector`` uses the
+    passed-in model as-is, so its extraction dtype is whatever we load here.
     """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    torch_dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }.get(dtype)
+    if torch_dtype is None:
+        raise ValueError(f"unknown dtype {dtype!r}; expected float16 | bfloat16 | float32")
+
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+
+    kwargs: dict[str, Any] = {"torch_dtype": torch_dtype}
+    if quant == "nf4":
+        # 4-bit nf4 (72B anchor). Needs bitsandbytes + CUDA; device_map handles
+        # placement, so we do NOT .to(device) afterwards.
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:  # pragma: no cover - dep not yet in lock
+            raise RuntimeError(
+                "nf4 quantization needs bitsandbytes (not in the lockfile). The 72B "
+                "anchor is HELD pending A2's DE-RISK verdict on 4-bit injection — do "
+                "not run this rung until both land."
+            ) from exc
+        kwargs["quantization_config"] = BitsAndBytesConfig(  # type: ignore[no-untyped-call]
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch_dtype
+        )
+        kwargs["device_map"] = {"": device}
+        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+        return model, tokenizer
+
+    if quant is not None:
+        raise ValueError(f"unknown quant {quant!r}; expected None | 'nf4'")
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     model = model.to(torch.device(device))  # type: ignore[arg-type]
     return model, tokenizer
 
@@ -129,6 +204,10 @@ def _free_cuda() -> None:
         pass
 
 
+def _noop() -> None:  # default on_model_done
+    pass
+
+
 def run_ladder(
     models: Sequence[str],
     *,
@@ -141,33 +220,74 @@ def run_ladder(
     device: str = "cpu",
     judge: JudgeLike | None = None,
     allow_rule_based_judge: bool = False,
+    precision_map: PrecisionMap | None = None,
+    # Cost guard (money): stop BEFORE a rung whose projected total would breach the
+    # cap; incremental write + on_model_done after each rung preserve a partial curve.
+    cost_rate_per_hour: float | None = None,
+    cost_cap_usd: float | None = None,
+    rung_gpu_hours: Mapping[str, float] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    on_model_done: Callable[[], None] = _noop,
     # Injected seams — defaults are the real A1/A2 callables (see module docstring).
     extract_fn: ExtractFn = extract_concept_vector,
     make_generator: GeneratorFactory | None = None,
     run_concept_fn: RunConceptFn = run_concept,
     write_seed_records_fn: WriteFn = write_seed_records,
     random_matched_fn: Callable[[ConceptVector, int], ConceptVector] = make_random_matched,
-    load_model_fn: Callable[[str, str], tuple[Any, Any]] = _load_causal_lm,
-) -> list[SeedRecord]:
-    """Run the full ladder and write ``SeedRecord`` JSONL to ``out_path``.
+    load_model_fn: Callable[..., tuple[Any, Any]] = _load_causal_lm,
+) -> LadderRun:
+    """Run the ladder (ascending order recommended) and write records incrementally.
 
-    ``models`` are HF ids (instruct variants). ``concepts`` are the words to
-    inject (subset of :data:`extract.CONCEPT_WORDS`). ``seeds`` should be ≥3.
-    All collaborators are injectable for testing; defaults wire A1 + A2.
+    ``models`` are HF ids (instruct variants). ``concepts`` are the words to inject
+    (subset of :data:`extract.CONCEPT_WORDS`). ``seeds`` should be ≥3. Per model,
+    ``precision_map`` gives ``(dtype, quant)`` (default float32/None).
+
+    Cost guard: when ``cost_rate_per_hour`` + ``cost_cap_usd`` are set, before each
+    rung we project ``spent + rung_gpu_hours[model]·rate`` and STOP (committing the
+    partial curve) if it would exceed the cap. Records are written and
+    ``on_model_done`` (e.g. a Modal volume commit) is called after every rung, so a
+    stop or crash never loses completed rungs.
     """
 
-    def _default_gen(model_id: str) -> DoseGeneratorLike:
-        return _default_generator(model_id, device=device)
+    def _default_gen(model_id: str, dtype: str, quant: str | None) -> DoseGeneratorLike:
+        return _default_generator(model_id, dtype, quant, device=device)
 
     gen_factory: GeneratorFactory = make_generator if make_generator is not None else _default_gen
     resolved_judge = _resolve_judge(judge, allow_rule_based=allow_rule_based_judge)
     rc_fn = run_concept_fn
     write_fn = write_seed_records_fn
+    prec = precision_map or {}
+    rung_h = rung_gpu_hours or {}
+    guard_on = cost_rate_per_hour is not None and cost_cap_usd is not None
 
+    model_list = list(models)
     all_trials: list[Any] = []
-    for model_id in models:
+    ran: list[str] = []
+    stopped_reason: str | None = None
+    t0 = clock()
+
+    def _spent() -> float:
+        return (clock() - t0) / 3600.0 * cost_rate_per_hour if cost_rate_per_hour else 0.0
+
+    for model_id in model_list:
+        # Cost guard: project this rung BEFORE paying for it.
+        if guard_on:
+            assert cost_cap_usd is not None and cost_rate_per_hour is not None
+            spent = _spent()
+            rung_cost = rung_h.get(model_id, 0.0) * cost_rate_per_hour
+            if spent + rung_cost > cost_cap_usd:
+                stopped_reason = (
+                    f"cost guard: projected ${spent + rung_cost:.2f} (spent ${spent:.2f} "
+                    f"+ est ${rung_cost:.2f} for {model_id}) > cap ${cost_cap_usd:.2f}"
+                )
+                print(f"[cost-guard] STOP before {model_id}: {stopped_reason}")
+                break
+
+        dtype, quant = prec.get(model_id, _DEFAULT_PRECISION)
+        spent_before = _spent()
+
         # Phase 1: extract every concept vector with a single model load, then free.
-        model, tokenizer = load_model_fn(model_id, device)
+        model, tokenizer = load_model_fn(model_id, device, dtype, quant)
         concept_vectors = [
             extract_fn(model_id, concept, model=model, tokenizer=tokenizer, device=device)
             for concept in concepts
@@ -176,7 +296,7 @@ def run_ladder(
         _free_cuda()
 
         # Phase 2: inject + sample + judge per concept (fresh ControlModel).
-        generator = gen_factory(model_id)
+        generator = gen_factory(model_id, dtype, quant)
         for cv in concept_vectors:
             all_trials.extend(
                 rc_fn(
@@ -192,8 +312,28 @@ def run_ladder(
             )
         del generator
         _free_cuda()
+        ran.append(model_id)
 
-    return write_fn(all_trials, out_path)
+        # Incremental write + commit so a later stop/crash keeps this rung.
+        write_fn(all_trials, out_path)
+        on_model_done()
+        if cost_rate_per_hour is not None:
+            spent_after = _spent()
+            print(
+                f"[cost] {model_id} ({dtype}"
+                + (f"/{quant}" if quant else "")
+                + f") done: ${spent_after - spent_before:.2f} | running total "
+                f"${spent_after:.2f}" + (f" / cap ${cost_cap_usd:.2f}" if cost_cap_usd else "")
+            )
+
+    records = write_fn(all_trials, out_path)
+    return LadderRun(
+        records=records,
+        ran=ran,
+        skipped=model_list[len(ran) :] if stopped_reason else [],
+        stopped_reason=stopped_reason,
+        spent_usd=_spent(),
+    )
 
 
 def _default_concepts(n: int) -> list[str]:
@@ -222,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     concepts = args.concepts if args.concepts is not None else _default_concepts(args.n_concepts)
-    records = run_ladder(
+    result = run_ladder(
         args.models,
         concepts=concepts,
         seeds=args.seeds,
@@ -233,7 +373,9 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         allow_rule_based_judge=args.allow_rule_based_judge,
     )
-    print(f"wrote {len(records)} seed records -> {args.out}")
+    print(f"wrote {len(result.records)} seed records -> {args.out}  (ran: {result.ran})")
+    if result.stopped_reason:
+        print(f"STOPPED: {result.stopped_reason}; skipped {result.skipped}")
     return 0
 
 
