@@ -27,16 +27,18 @@ import matplotlib.pyplot as plt  # noqa: E402
 from .stats import ModelPoint  # noqa: E402
 
 #: model_id -> (family, nominal parameter count). Nominal = the label size, used
-#: only to position points on the log-x axis. Extend as A1/A2 lock the ladder.
+#: only to position points on the log-x axis.
+#: Instruct variants: the introspection task is a chat self-report, so base
+#: models (which can't follow the protocol) would manufacture false nulls.
 KNOWN_MODELS: dict[str, tuple[str, float]] = {
-    "Qwen/Qwen2.5-0.5B": ("Qwen2.5", 0.5e9),
-    "Qwen/Qwen2.5-1.5B": ("Qwen2.5", 1.5e9),
-    "Qwen/Qwen2.5-3B": ("Qwen2.5", 3.0e9),
-    "Qwen/Qwen2.5-7B": ("Qwen2.5", 7.0e9),
-    "Qwen/Qwen2.5-14B": ("Qwen2.5", 14.0e9),
-    "meta-llama/Llama-3.2-1B": ("Llama3.x", 1.0e9),
-    "meta-llama/Llama-3.2-3B": ("Llama3.x", 3.0e9),
-    "meta-llama/Llama-3.1-8B": ("Llama3.x", 8.0e9),
+    "Qwen/Qwen2.5-0.5B-Instruct": ("Qwen2.5", 0.5e9),
+    "Qwen/Qwen2.5-1.5B-Instruct": ("Qwen2.5", 1.5e9),
+    "Qwen/Qwen2.5-3B-Instruct": ("Qwen2.5", 3.0e9),
+    "Qwen/Qwen2.5-7B-Instruct": ("Qwen2.5", 7.0e9),
+    "Qwen/Qwen2.5-14B-Instruct": ("Qwen2.5", 14.0e9),
+    "meta-llama/Llama-3.2-1B-Instruct": ("Llama3.x", 1.0e9),
+    "meta-llama/Llama-3.2-3B-Instruct": ("Llama3.x", 3.0e9),
+    "meta-llama/Llama-3.1-8B-Instruct": ("Llama3.x", 8.0e9),
 }
 
 _FAMILY_COLORS: dict[str, str] = {"Qwen2.5": "#1f77b4", "Llama3.x": "#d62728"}
