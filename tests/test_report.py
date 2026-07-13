@@ -17,7 +17,11 @@ from introspection_scaling.records import (
 from introspection_scaling.report import main
 from introspection_scaling.stats import model_points
 
-_MODELS = ["Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-7B", "meta-llama/Llama-3.2-1B"]
+_MODELS = [
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "meta-llama/Llama-3.2-1B-Instruct",
+]
 
 
 def _synthetic_records() -> list[SeedRecord]:
