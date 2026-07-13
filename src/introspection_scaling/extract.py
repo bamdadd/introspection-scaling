@@ -243,7 +243,8 @@ class ConceptVector:
     Attributes:
         concept: the concept word used to build the positive prompt (the join
             key A2 aggregates on; use the strings in :data:`CONCEPT_WORDS`).
-        model_id: HF id the vector was extracted on, e.g. ``"Qwen/Qwen2.5-0.5B"``.
+        model_id: HF id the vector was extracted on, e.g.
+            ``"Qwen/Qwen2.5-0.5B-Instruct"``.
         directions: block-output index -> unit-L2 direction, shape ``(hidden,)``.
         raw_norms: block-output index -> ``||raw diff-of-means||`` (auxiliary;
             see module docstring). Copied unchanged by :func:`make_random_matched`.

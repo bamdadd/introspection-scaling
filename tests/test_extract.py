@@ -15,7 +15,7 @@ from introspection_scaling.extract import (
     make_random_matched,
 )
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B"
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
 # --- word lists ------------------------------------------------------------
@@ -120,7 +120,7 @@ def test_extract_concept_vector_on_qwen() -> None:
 
     assert cv.concept == "Oceans"
     assert cv.model_id == MODEL_ID
-    # every block extracted (Qwen2.5-0.5B has 24 blocks)
+    # every block extracted (Qwen2.5-0.5B-Instruct has 24 blocks)
     assert set(cv.directions) == set(range(24))
     assert cv.directions.keys() == cv.raw_norms.keys()
 
