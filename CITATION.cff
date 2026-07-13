@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "introspection-scaling"
+abstract: "Does concept-injection introspection emerge with scale? A faithful reproduction charted across model-size ladders."
+authors:
+  - family-names: "Dashtban"
+    given-names: "Bamdad"
+license: "MIT"
+repository-code: "https://github.com/bamdadd/introspection-scaling"
+date-released: "2026-01-01"
