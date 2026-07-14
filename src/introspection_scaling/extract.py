@@ -247,6 +247,8 @@ def load_baseline_words(path: str | Path) -> tuple[str, ...]:
         if word and word not in seen:
             seen.add(word)
             words.append(word)
+    if not words:
+        raise ValueError(f"Baseline file contains no words: {path}")
     return tuple(words)
 
 

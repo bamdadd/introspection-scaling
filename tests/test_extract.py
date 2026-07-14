@@ -50,6 +50,17 @@ def test_load_baseline_words_strips_comments_blanks_and_duplicates(tmp_path: Pat
     assert load_baseline_words(path) == ("ocean", "cloud", "rain")
 
 
+@pytest.mark.parametrize("contents", ["", "# comments only\n  # another comment\n"])
+def test_load_baseline_words_rejects_files_without_words(
+    tmp_path: Path, contents: str
+) -> None:
+    path = tmp_path / "baseline.txt"
+    path.write_text(contents)
+
+    with pytest.raises(ValueError, match=f"Baseline file contains no words: {path}"):
+        load_baseline_words(path)
+
+
 # --- dataset ---------------------------------------------------------------
 
 
