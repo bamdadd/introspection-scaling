@@ -67,11 +67,13 @@ def plot_scaling_curve(
     *,
     registry: Mapping[str, tuple[str, float]] = KNOWN_MODELS,
     title: str = "Introspective detection vs parameter count",
+    caption: str | None = None,
+    ymax: float | None = None,
 ) -> Path:
     """Render the hero scaling curve to ``out_path`` (PNG). Returns the path.
 
     Standalone-readable: the caption text is baked into the figure so the PNG
-    explains itself without the paper.
+    explains itself without the paper. Pass ``caption`` to override the default.
     """
     if not points:
         raise ValueError("no model points to plot")
@@ -157,19 +159,20 @@ def plot_scaling_curve(
     ax.set_xscale("log")
     ax.set_xlabel("Parameter count (nominal, log scale)")
     ax.set_ylabel("Introspective detection rate")
-    ax.set_ylim(-0.02, 1.02)
+    # Default full 0-1 scale; ymax zooms into a near-floor regime (small effects).
+    ax.set_ylim((-0.02 * ymax, ymax * 1.02) if ymax is not None else (-0.02, 1.02))
     ax.set_title(title)
     ax.grid(True, which="both", axis="both", alpha=0.25)
     ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
 
-    caption = (
+    caption_text = caption or (
         "Injected concept-detection rate (solid, bootstrap 95% band) vs both "
         "controls per model:\nno-injection (dotted) and random-direction "
         "matched-norm (dashed). Filled marker = injected\nband clears BOTH "
         "controls (above chance); open marker = not distinguishable from chance.\n"
         "Rates pooled over concepts; band = percentile bootstrap over ≥3 seeds."
     )
-    fig.text(0.5, -0.02, caption, ha="center", va="top", fontsize=8, wrap=True)
+    fig.text(0.5, -0.02, caption_text, ha="center", va="top", fontsize=8, wrap=True)
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
