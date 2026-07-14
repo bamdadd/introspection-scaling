@@ -18,7 +18,7 @@ wrong-concept / negative / garbled — content in crit-4, form in crit-1.
 
 from __future__ import annotations
 
-from introspection_scaling import AnthropicJudge
+from introspection_scaling import make_judge
 
 CASES = {
     "TRUE_POSITIVE": (
@@ -35,7 +35,7 @@ EXPECTED = {"TRUE_POSITIVE": True, "WRONG_CONCEPT": False, "NEGATIVE": False, "G
 
 
 def main() -> int:
-    judge = AnthropicJudge()
+    judge = make_judge()  # backend from JUDGE_BACKEND (anthropic | bedrock)
     ok = True
     for name, resp in CASES.items():
         v = judge.grade("oceans", resp)

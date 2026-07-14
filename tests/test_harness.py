@@ -15,6 +15,7 @@ from introspection_scaling.harness import (
     INTROSPECTION_PREAMBLE,
     TRIAL_QUESTION,
     AnthropicJudge,
+    BedrockJudge,
     Completion,
     Condition,
     JudgeVerdict,
@@ -31,6 +32,7 @@ from introspection_scaling.harness import (
     generate_concept_completions,
     judge_completions,
     layer_for_fraction,
+    make_judge,
     render_prompt,
     run_concept,
     run_conditions,
@@ -734,3 +736,57 @@ def test_grade_many_never_raises_on_api_error(monkeypatch):
     verdicts = judge.grade_many([("oceans", "x"), ("oceans", "y")])
     assert len(verdicts) == 2
     assert all(v.parse_error and not v.success for v in verdicts)
+
+
+# --- Bedrock judge backend (mock boto3 client) ------------------------------ #
+
+
+class _FakeBedrockClient:
+    def __init__(self, behaviour):
+        self._behaviour = behaviour
+
+    def converse(self, **kwargs):  # type: ignore[no-untyped-def]
+        return self._behaviour()
+
+
+def _bedrock_with(behaviour) -> BedrockJudge:  # type: ignore[no-untyped-def]
+    j = object.__new__(BedrockJudge)
+    j.model = "fake"
+    j.temperature = 0.0
+    j._client = _FakeBedrockClient(behaviour)
+    return j
+
+
+def _bedrock_ok(text):  # type: ignore[no-untyped-def]
+    return lambda: {"output": {"message": {"content": [{"text": text}]}}}
+
+
+def test_bedrock_grade_parses_valid_and_never_raises():
+    good = (
+        '{"coherent": true, "affirmative": true, '
+        '"detects_before_naming": true, "correct_identification": true}'
+    )
+    v = _bedrock_with(_bedrock_ok(good)).grade("oceans", "x")
+    assert v.success and not v.parse_error
+
+    def boom():
+        raise RuntimeError("sso token expired")
+
+    v2 = _bedrock_with(boom).grade("oceans", "y")
+    assert v2.parse_error and not v2.success
+
+
+def test_bedrock_grade_many_preserves_order():
+    good = (
+        '{"coherent": true, "affirmative": false, '
+        '"detects_before_naming": false, "correct_identification": false}'
+    )
+    judge = _bedrock_with(_bedrock_ok(good))
+    verdicts = judge.grade_many([("oceans", "a"), ("oceans", "b"), ("oceans", "c")], concurrency=2)
+    assert len(verdicts) == 3
+    assert all(v.coherent and not v.success and not v.parse_error for v in verdicts)
+
+
+def test_make_judge_unknown_backend_raises():
+    with pytest.raises(ValueError, match="unknown JUDGE_BACKEND"):
+        make_judge("gemini")

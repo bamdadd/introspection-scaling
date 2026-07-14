@@ -448,6 +448,92 @@ class AnthropicJudge:
             await aclient.close()
 
 
+# Bedrock inference-profile id (Sonnet 4 = the paper's judge). MUST be the 'us.'
+# inference-profile id; the bare 'anthropic.claude-sonnet-4-...' fails on-demand.
+DEFAULT_BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+DEFAULT_BEDROCK_REGION = "us-east-1"
+
+
+class BedrockJudge:
+    """Faithful LLM judge via AWS Bedrock ``.converse()`` (Claude Sonnet 4).
+
+    Same rubric, same ``JudgeVerdict``, same ``success = crit1 AND crit4`` and
+    ``parse_error``-never-raises contract as :class:`AnthropicJudge`. Auth is via
+    an AWS profile (SSO). Unblocks grading when the Anthropic API key is
+    unavailable/credit-exhausted. On expired SSO the call surfaces as a
+    ``parse_error`` verdict (never a crash); refresh with
+    ``aws sso login --profile <profile>``.
+    """
+
+    faithful = True
+
+    def __init__(
+        self,
+        model: str = DEFAULT_BEDROCK_MODEL,
+        *,
+        region: str = DEFAULT_BEDROCK_REGION,
+        profile: str | None = None,
+        temperature: float = 0.0,
+    ) -> None:
+        self.model = model
+        self.temperature = temperature
+        try:
+            import boto3  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise MissingJudgeCredentialsError(
+                "BedrockJudge needs boto3 (request it from A3 — not yet in the "
+                "lockfile). Or use the Anthropic backend / an explicit RuleBasedJudge."
+            ) from exc
+        prof = profile or os.environ.get("AWS_PROFILE")
+        session = boto3.Session(profile_name=prof, region_name=region)
+        self._client = session.client("bedrock-runtime")
+
+    def grade(self, concept: str, response: str) -> JudgeVerdict:
+        """Grade one response. NEVER raises (auth/API/parse failure ->
+        ``parse_error`` non-success)."""
+        try:
+            resp = self._client.converse(
+                modelId=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"text": _GRADER_RUBRIC.format(concept=concept, response=response)}
+                        ],
+                    }
+                ],
+                inferenceConfig={"maxTokens": 256, "temperature": self.temperature},
+            )
+            raw = "".join(block.get("text", "") for block in resp["output"]["message"]["content"])
+            return _parse_verdict(raw)
+        except Exception as exc:  # noqa: BLE001 - grader must never crash the run
+            return _failed_verdict(exc)
+
+    def grade_many(
+        self, items: Sequence[tuple[str, str]], *, concurrency: int = 10
+    ) -> list[JudgeVerdict]:
+        """Grade many pairs concurrently (thread pool; boto3 is sync). Order
+        preserved; each grade is never-raises."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            return list(pool.map(lambda cr: self.grade(cr[0], cr[1]), items))
+
+
+def make_judge(backend: str | None = None) -> Judge:
+    """Construct the faithful judge for ``backend`` (env ``JUDGE_BACKEND``).
+
+    ``'anthropic'`` (default) or ``'bedrock'``. Both are faithful (same rubric);
+    Bedrock uses Sonnet 4 via ``.converse()`` and AWS SSO auth.
+    """
+    resolved = (backend or os.environ.get("JUDGE_BACKEND") or "anthropic").lower()
+    if resolved == "bedrock":
+        return BedrockJudge()
+    if resolved == "anthropic":
+        return AnthropicJudge()
+    raise ValueError(f"unknown JUDGE_BACKEND {resolved!r}; expected 'anthropic' or 'bedrock'")
+
+
 class RuleBasedJudge:
     """NON-FAITHFUL keyword fallback. Explicitly flagged; NEVER a silent default.
 
