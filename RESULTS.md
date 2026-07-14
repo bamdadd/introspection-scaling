@@ -16,7 +16,11 @@ Injection itself is not inert (an *oceans* vector visibly bends the generated
 text); what is absent is the model *noticing and naming* the injected thought.
 The paper's effect is strongest in far larger, more heavily post-trained models;
 this is a clean **lower bound**: introspection does not appear at or below 32B in
-this family.
+this family. **Read with the calibration caveat below:** the same pipeline also
+returned a clean null on Qwen2.5-Coder-32B-Instruct — a third-party-reported
+known-positive open model — so we could not reproduce a known positive. Treat
+these nulls as "this pipeline did not elicit introspection here," not a hard
+capability bound, until the calibration is fixed.
 
 ## Ladder (Qwen2.5-Instruct, one A100-80GB, fp16)
 
@@ -54,6 +58,32 @@ wall-clock longer due to per-rung weight loads). **Judge:** Anthropic API, separ
   Qwen curve unaffected). Single family so far.
 - A null at 32B does not contradict the paper (its effect is in much larger,
   differently post-trained models); it bounds where the ability is *absent*.
+
+---
+
+## Calibration — known-positive reproduction check (FAILED to reproduce)
+
+The ladder above ran only the **Instruct** family. To test whether this pipeline
+reproduces the reported effect *at all*, we ran the exact third-party-reported
+known-positive open model — **Qwen2.5-Coder-32B-Instruct** — through the identical
+pipeline (fp16, one A100-80GB, depth 0.61, α = 0.044·‖resid‖ with measured
+‖resid‖ ≈ 445 → α ≈ 19.6, 6 concepts × 12 trials × 3 seeds, faithful Anthropic
+judge).
+
+| Model | Injected | No-inj ctrl | Rand-dir ctrl | Above chance? | GPU $ |
+|-------|---------:|------------:|--------------:|:-------------:|------:|
+| Qwen2.5-Coder-32B-Instruct | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | no | 0.77 |
+
+**Result: also a clean null (0/216 injected).** We could **not** elicit the
+reported open-model positive even on the exact model. This is an **honest failed
+reproduction**, and it is the most important caveat on the whole result: read the
+nulls above as *"this pipeline did not elicit detect-and-name introspection
+here,"* **not** as a hard capability bound. What we failed to reproduce may need a
+setup we do not match — the injection layer/strength, the detection prompt, or a
+grader less strict than `coherent AND correct identification`. Fixing the
+calibration (getting a real positive on a known-positive model) is the
+prerequisite for trusting the scaling nulls as capability claims. Raw data:
+[`results/records_coder32b.jsonl`](results/records_coder32b.jsonl).
 
 ---
 
