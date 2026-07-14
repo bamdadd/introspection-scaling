@@ -77,7 +77,8 @@ def _grade_all(judge, trials: list[TrialRaw]) -> list[TrialRaw]:
             raw_judge=v.raw,
         )
 
-    with ThreadPoolExecutor(max_workers=16) as ex:
+    # 4 workers: Bedrock on-demand throttles at higher concurrency (16 -> 429s).
+    with ThreadPoolExecutor(max_workers=4) as ex:
         return list(ex.map(one, trials))  # map re-raises the first exception
 
 
