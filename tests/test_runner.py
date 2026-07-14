@@ -31,6 +31,8 @@ class _Recorder:
         self.loads: list[tuple] = []
         self.gen_calls: list[tuple] = []
         self.written: list = []
+        self.trials_written: list = []
+        self.trials_paths: list[str] = []
         self.commits = 0
 
     def load_model(self, model_id, device, dtype="float32", quant=None):
@@ -65,6 +67,11 @@ class _Recorder:
             SeedRecord(m, "Oceans", "injected", 0, 1, 1) for m in {t.split(":")[1] for t in trials}
         ]
 
+    def write_trials(self, trials, path):
+        self.trials_written = list(trials)
+        self.trials_paths.append(str(path))
+        return list(trials)
+
     def commit(self) -> None:
         self.commits += 1
 
@@ -82,10 +89,26 @@ def _run(rec: _Recorder, path: Path, **kw) -> LadderRun:
         generate_completions_fn=rec.gen_completions,
         judge_completions_fn=rec.judge,
         write_seed_records_fn=rec.write,
+        write_trials_fn=rec.write_trials,
         load_model_fn=rec.load_model,
         on_model_done=rec.commit,
         **kw,
     )
+
+
+def test_raw_trials_written_when_trials_path_set(tmp_path: Path) -> None:
+    rec = _Recorder()
+    _run(rec, tmp_path / "records.jsonl", trials_path=tmp_path / "trials.jsonl")
+    assert rec.trials_written  # the re-judgeable raw layer was written
+    assert rec.trials_paths and rec.trials_paths[-1].endswith("trials.jsonl")
+    # same trials feed both the counts writer and the raw writer
+    assert len(rec.trials_written) == len(rec.written)
+
+
+def test_no_raw_trials_when_trials_path_unset(tmp_path: Path) -> None:
+    rec = _Recorder()
+    _run(rec, tmp_path / "records.jsonl")  # no trials_path -> counts only
+    assert rec.trials_written == [] and rec.trials_paths == []
 
 
 def test_generate_called_per_model_and_concept(tmp_path: Path) -> None:

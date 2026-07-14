@@ -48,7 +48,7 @@ from .harness import (
     judge_completions,
     write_seed_records,
 )
-from .records import SeedRecord
+from .records import SeedRecord, write_trial_records
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -205,6 +205,9 @@ def run_ladder(
     seeds: Sequence[int],
     n_trials: int,
     out_path: str | Path = "results/records.jsonl",
+    # Raw per-trial layer (transcripts + verdicts incl parse_error) for audit +
+    # offline re-judge. Written beside the counts when set. None = counts only.
+    trials_path: str | Path | None = None,
     depth_fraction: float = DEPTH_FRACTION,
     dose_fraction: float = DOSE_FRACTION,
     device: str = "cpu",
@@ -224,6 +227,7 @@ def run_ladder(
     generate_completions_fn: GenerateCompletionsFn = generate_concept_completions,
     judge_completions_fn: JudgeCompletionsFn = judge_completions,
     write_seed_records_fn: WriteFn = write_seed_records,
+    write_trials_fn: Callable[..., Any] = write_trial_records,
     random_matched_fn: Callable[[ConceptVector, int], ConceptVector] = make_random_matched,
     load_model_fn: Callable[..., tuple[Any, Any]] = _load_causal_lm,
 ) -> LadderRun:
@@ -310,8 +314,11 @@ def run_ladder(
         all_trials.extend(judge_fn(completions, judge=resolved_judge))
         ran.append(model_id)
 
-        # Incremental write + commit so a later stop/crash keeps this rung.
+        # Incremental write + commit so a later stop/crash keeps this rung. Write
+        # BOTH the counts and (when requested) the re-judgeable raw per-trial layer.
         write_fn(all_trials, out_path)
+        if trials_path is not None:
+            write_trials_fn(all_trials, trials_path)
         on_model_done()
         if cost_rate_per_hour is not None:
             spent_after = _spent()
@@ -323,6 +330,8 @@ def run_ladder(
             )
 
     records = write_fn(all_trials, out_path)
+    if trials_path is not None:
+        write_trials_fn(all_trials, trials_path)
     return LadderRun(
         records=records,
         ran=ran,
