@@ -525,17 +525,33 @@ def run_coder_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> d
         os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
 
     # --- FIT CHECK + DOSE OBSERVABILITY (observe, never tune) ---
+    # ONE model resident at a time (32B fp16 ~64 GB; two copies OOM an 80 GB A100):
+    # Phase 1 extract (fp16) -> free -> Phase 2 generator + verify -> free.
+    from introspection_scaling.runner import _load_causal_lm
+
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     try:
-        gen = RepengGenerator(
-            CALIBRATION_MODEL, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        emodel, etok = _load_causal_lm(CALIBRATION_MODEL, "cuda", "float16", None)
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        cv = extract_concept_vector(
+            CALIBRATION_MODEL, "oceans", model=emodel, tokenizer=etok, device="cuda"
         )
-        layer = layer_for_fraction(gen.n_layers)  # depth 0.61
-        cv = extract_concept_vector(CALIBRATION_MODEL, "oceans", device="cuda")
+        del emodel, etok
+        _free()
         if layer not in cv.raw_norms:
             raise RuntimeError(f"raw_norms missing injection layer {layer}")
         raw_norm = float(cv.raw_norms[layer])
         alpha = CODER_K2_STRENGTH_K * raw_norm
+        gen = RepengGenerator(
+            CALIBRATION_MODEL, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        )
         diag = {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+        del gen, cv
+        _free()
     except Exception as exc:  # noqa: BLE001 - report the fit/dose failure, run no sweep
         return {
             "fit_ok": False,
@@ -546,10 +562,6 @@ def run_coder_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> d
         f"[dose] layer={layer} raw_norm={raw_norm:.3f} k={CODER_K2_STRENGTH_K} alpha={alpha:.3f} "
         f"ratio={diag['magnitude_ratio']:.3f} cos={diag['cosine_to_v_unit']:.3f}"
     )
-    del gen, cv
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     # --- Generate (RuleBasedJudge PLACEHOLDER; transcripts are the payload) ---
     result = _run(
