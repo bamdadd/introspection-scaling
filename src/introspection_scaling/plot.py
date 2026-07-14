@@ -41,6 +41,9 @@ KNOWN_MODELS: dict[str, tuple[str, float]] = {
     "meta-llama/Llama-3.2-1B-Instruct": ("Llama3.x", 1.0e9),
     "meta-llama/Llama-3.2-3B-Instruct": ("Llama3.x", 3.0e9),
     "meta-llama/Llama-3.1-8B-Instruct": ("Llama3.x", 8.0e9),
+    # Coder-32B calibration point: own family so it renders distinct from the
+    # Instruct line at the same 32B size (fine-tune comparison).
+    "Qwen/Qwen2.5-Coder-32B-Instruct": ("Qwen2.5-Coder", 32.0e9),
 }
 
 _FAMILY_COLORS: dict[str, str] = {"Qwen2.5": "#1f77b4", "Llama3.x": "#d62728"}

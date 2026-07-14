@@ -140,9 +140,18 @@ LLAMA_LADDER: tuple[str, ...] = (
 # bitsandbytes/nf4 AND A2's DE-RISK verdict that repeng injection works in 4-bit.
 HELD_ANCHOR_72B = "Qwen/Qwen2.5-72B-Instruct"
 
+# One-off calibration (human-authorized single run, NOT part of the fireable
+# ladder): Qwen2.5-Coder-32B-Instruct — the third-party KNOWN-POSITIVE open model.
+# Our ladder only ran the Instruct family; this checks whether the pipeline
+# reproduces the reported effect at all. fp16, separate path, HARD $10 cap.
+CALIBRATION_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct"
+CALIBRATION_RECORDS = f"{_RESULTS_DIR}/records_coder32b.jsonl"
+CALIBRATION_CAP_USD = 10.0
+
 # Per-model precision (SHARED CONTRACT). <=32B -> fp16; 72B anchor -> bf16 + nf4.
 PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     **{m: ("float16", None) for m in QWEN_LADDER + LLAMA_LADDER},
+    CALIBRATION_MODEL: ("float16", None),  # explicit: default would be float32 (OOMs 32B)
     HELD_ANCHOR_72B: ("bfloat16", "nf4"),
 }
 
@@ -166,6 +175,9 @@ RUNG_GPU_HOURS: dict[str, float] = {
     # 72B 4-bit anchor (bf16+nf4). Biased high so the $80 guard projection is real
     # on a single-rung run (else it defaults to 0.0 and only the timeout backstops).
     HELD_ANCHOR_72B: 8.0,
+    # Coder-32B calibration: same size as Qwen 32B-Instruct (actual ~$1.12); 2.4h
+    # is biased-high yet projects $9.6 < the $10 cap so the guard allows the start.
+    CALIBRATION_MODEL: 2.4,
 }
 
 # 72B anchor records go to a SEPARATE volume path — write_records opens mode 'w'
@@ -380,6 +392,92 @@ def run_anchor_72b(concepts: list[str], seeds: list[int], n_trials: int = 12) ->
         "stopped_reason": result.stopped_reason,
         "spent_usd_gpu": round(result.spent_usd, 2),
     }
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=_SECRETS,
+    timeout=6 * 3600,
+)
+def run_calibration(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """One-off fp16 calibration on Coder-32B (human-authorized single run).
+
+    FIT CHECK FIRST: load the fp16 RepengGenerator and take one resid-norm forward
+    pass. If it OOMs / can't run, return ``fit_ok=False`` and run NO sweep (no
+    crash-loop). If it fits, run the $10-capped single-rung sweep to a SEPARATE
+    path (records_coder32b.jsonl — never the committed records.jsonl).
+    """
+    import gc
+
+    import torch
+
+    from introspection_scaling.harness import RepengGenerator, layer_for_fraction
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    # --- FIT CHECK (fp16 32B ~ 64 GB; Instruct-32B fit at $1.12). Fail clean. ---
+    try:
+        gen = RepengGenerator(
+            CALIBRATION_MODEL, device="cuda", dtype="float16", quant=None, max_new_tokens=4
+        )
+        layer = layer_for_fraction(gen.n_layers)
+        resid_norm = gen.measure_resid_norm(layer)
+        if not (resid_norm == resid_norm and resid_norm > 0):  # finite + positive
+            raise RuntimeError(f"non-finite resid_norm {resid_norm}")
+    except Exception as exc:  # noqa: BLE001 - report the fit failure, run no sweep
+        return {
+            "fit_ok": False,
+            "model_id": CALIBRATION_MODEL,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    print(f"[fit] {CALIBRATION_MODEL} fp16 OK: layer={layer} resid_norm={resid_norm:.2f}")
+    del gen
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Sweep (single rung, HARD $10 cap, separate path) ---
+    result = _run(
+        [CALIBRATION_MODEL],
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=CALIBRATION_RECORDS,
+        depth_fraction=0.61,
+        dose_fraction=0.044,
+        device="cuda",
+        precision_map=PRECISION_MAP,
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=CALIBRATION_CAP_USD,
+        rung_gpu_hours=RUNG_GPU_HOURS,
+        on_model_done=_results_vol.commit,
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "fit_ok": True,
+        "n_records": len(result.records),
+        "out": CALIBRATION_RECORDS,
+        "ran": result.ran,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+        "fit_resid_norm": round(resid_norm, 2),
+    }
+
+
+@app.local_entrypoint()
+def calibration(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::calibration` — Coder-32B fp16 calibration ($10 cap)."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_calibration.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("calibration:", result)
 
 
 @app.local_entrypoint()
