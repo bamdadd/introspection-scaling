@@ -134,5 +134,11 @@ published hardware + wall-clock · negative results reported plainly.
 ## Status
 Scaffold. See [RESULTS.md](RESULTS.md) and open issues.
 
+## Contributing
+Contributions welcome — start with the
+[good first issues](https://github.com/bamdadd/introspection-scaling/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+Each is small, self-contained, and ships with file:line pointers and acceptance
+criteria. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and the checks to run.
+
 ## License
 MIT.
