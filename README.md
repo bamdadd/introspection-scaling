@@ -8,12 +8,16 @@
 detection and both controls (no-injection, random-matched) sit at 0 across the
 whole ladder: no concept-injection introspection emerges at or below 32B.](results/scaling_curve.png)
 
-**First result:** across Qwen2.5-Instruct 0.5→32B, injected-concept detection is
-**0/216 at every rung — and so are both controls.** A clean null with clean
-controls (the [positive control](scripts/positive_control.py) confirms the judge
-*can* score a hit, so this is a real absence, not a dead instrument). See
-[RESULTS.md](RESULTS.md). 72B and the Llama-3.x family are pending; details and
-limitations there.
+> ⚠️ **Correction in progress (2026-07-14).** The curve above used a **sub-threshold
+> injection dose**. At the corrected dose (`α = 2·‖raw diff-of-means‖`) with a
+> working, fails-loud judge, **Qwen2.5-Coder-32B-Instruct reproduces the effect**
+> (above-chance detection, 2.3% vs 0% both controls). The null curve is **superseded /
+> under-dosed**; a corrected-dose ladder is re-running. See [RESULTS.md](RESULTS.md).
+
+**Original (superseded) result:** across Qwen2.5-Instruct 0.5→32B, injected-concept
+detection was **0/216 at every rung — and so were both controls.** Read as
+under-dosed (see the correction above), not a capability bound. 72B and Llama-3.x
+were pending; details and limitations in [RESULTS.md](RESULTS.md).
 
 ## The question
 Large models can sometimes *detect* when a concept has been injected into

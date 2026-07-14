@@ -1,5 +1,16 @@
 # Results
 
+> ⚠️ **Correction in progress (2026-07-14).** The results below used an injection
+> dose we have since found to be **sub-threshold** — `α = 0.044·‖resid‖`, selected
+> for steering coherence, ~4–18× below the paper's absolute strength. At the
+> corrected dose (`α = 2·‖raw diff-of-means‖`, the paper's regime) with a working,
+> fails-loud judge, **Qwen2.5-Coder-32B-Instruct shows above-chance introspective
+> detection** (2.3%, 5/216, vs 0.0% for both controls; non-overlapping 95% CIs) —
+> i.e. **the pipeline does reproduce the effect.** The "failed to reproduce" and
+> "≤32B clean null" claims below are therefore **withdrawn as under-dosed /
+> superseded.** A corrected-dose ladder is re-running and will replace these
+> numbers; the original artifacts are kept below for transparency.
+
 ![scaling curve](results/scaling_curve.png)
 
 ## Finding
@@ -61,7 +72,11 @@ wall-clock longer due to per-rung weight loads). **Judge:** Anthropic API, separ
 
 ---
 
-## Calibration — known-positive reproduction check (FAILED to reproduce)
+## Calibration — known-positive reproduction check (WITHDRAWN — see correction banner)
+
+> **Withdrawn (2026-07-14):** this section's 0/216 was produced at the sub-threshold
+> dose. At the corrected dose Coder-32B is above chance (see banner). The table below
+> is retained only as the superseded original.
 
 The ladder above ran only the **Instruct** family. To test whether this pipeline
 reproduces the reported effect *at all*, we ran the exact third-party-reported
