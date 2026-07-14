@@ -359,6 +359,27 @@ def test_rule_based_judge_flagged_non_faithful():
     assert not v2.success
 
 
+def test_looks_coherent():
+    from introspection_scaling.harness import _looks_coherent
+
+    # 1. Empty or whitespace-only text (should return False)
+    assert _looks_coherent("") is False
+    assert _looks_coherent("   ") is False
+
+    # 2. Fewer than 2 words (should return False)
+    assert _looks_coherent("hello") is False
+
+    # 3. High repetition where most common word / total words >= 0.5 (should return False)
+    assert _looks_coherent("hello hello") is False  # ratio = 2/2 = 1.0
+    assert _looks_coherent("hello world hello") is False  # ratio = 2/3 = 0.67
+    assert _looks_coherent("hello world hello world") is False  # ratio = 2/4 = 0.5
+
+    # 4. Low repetition where most common word / total words < 0.5 (should return True)
+    assert _looks_coherent("hello world again") is True  # ratio = 1/3 = 0.33
+    assert _looks_coherent("hello world hello world again") is True  # ratio = 2/5 = 0.4
+    assert _looks_coherent("the quick brown fox jumps over the lazy dog") is True  # ratio = 2/9
+
+
 # --- judge robustness: a bad grade must never crash a ladder run ----------- #
 
 
