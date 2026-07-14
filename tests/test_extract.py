@@ -51,9 +51,7 @@ def test_load_baseline_words_strips_comments_blanks_and_duplicates(tmp_path: Pat
 
 
 @pytest.mark.parametrize("contents", ["", "# comments only\n  # another comment\n"])
-def test_load_baseline_words_rejects_files_without_words(
-    tmp_path: Path, contents: str
-) -> None:
+def test_load_baseline_words_rejects_files_without_words(tmp_path: Path, contents: str) -> None:
     path = tmp_path / "baseline.txt"
     path.write_text(contents)
 
