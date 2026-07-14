@@ -42,6 +42,7 @@ block (0..N-1).
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
@@ -230,6 +231,25 @@ BASELINE_WORDS: tuple[str, ...] = (
     "valve",
     "nozzle",
 )
+
+
+def load_baseline_words(path: str | Path) -> tuple[str, ...]:
+    """Load an ordered, de-duplicated baseline word list from a text file.
+
+    Blank lines and comments (including inline comments) are ignored. The first
+    occurrence of each remaining word is retained so a curated file can be
+    reviewed and reproduced exactly.
+    """
+    words: list[str] = []
+    seen: set[str] = set()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        word = line.split("#", maxsplit=1)[0].strip()
+        if word and word not in seen:
+            seen.add(word)
+            words.append(word)
+    if not words:
+        raise ValueError(f"Baseline file contains no words: {path}")
+    return tuple(words)
 
 
 # ---------------------------------------------------------------------------

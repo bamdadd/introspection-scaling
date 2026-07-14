@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -14,6 +16,7 @@ from introspection_scaling.extract import (
     _unit,
     build_dataset,
     extract_concept_vector,
+    load_baseline_words,
     load_extraction_model,
     make_random_matched,
 )
@@ -38,6 +41,22 @@ def test_concept_and_baseline_disjoint() -> None:
     concepts = {w.lower() for w in CONCEPT_WORDS}
     baselines = {w.lower() for w in BASELINE_WORDS}
     assert concepts.isdisjoint(baselines)
+
+
+def test_load_baseline_words_strips_comments_blanks_and_duplicates(tmp_path: Path) -> None:
+    path = tmp_path / "baseline.txt"
+    path.write_text("# curated list\n ocean \n\ncloud # inline comment\nocean\nrain\n")
+
+    assert load_baseline_words(path) == ("ocean", "cloud", "rain")
+
+
+@pytest.mark.parametrize("contents", ["", "# comments only\n  # another comment\n"])
+def test_load_baseline_words_rejects_files_without_words(tmp_path: Path, contents: str) -> None:
+    path = tmp_path / "baseline.txt"
+    path.write_text(contents)
+
+    with pytest.raises(ValueError, match=f"Baseline file contains no words: {path}"):
+        load_baseline_words(path)
 
 
 # --- dataset ---------------------------------------------------------------

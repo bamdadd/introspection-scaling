@@ -34,9 +34,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .extract import (
+    BASELINE_WORDS,
     CONCEPT_WORDS,
     ConceptVector,
     extract_concept_vector,
+    load_baseline_words,
     make_random_matched,
 )
 from .harness import (
@@ -209,6 +211,7 @@ def run_ladder(
     models: Sequence[str],
     *,
     concepts: Sequence[str],
+    baseline_words: tuple[str, ...] = BASELINE_WORDS,
     seeds: Sequence[int],
     n_trials: int,
     out_path: str | Path = "results/records.jsonl",
@@ -294,7 +297,14 @@ def run_ladder(
         # Phase 1: extract every concept vector with a single model load, then free.
         model, tokenizer = load_model_fn(model_id, device, dtype, quant)
         concept_vectors = [
-            extract_fn(model_id, concept, model=model, tokenizer=tokenizer, device=device)
+            extract_fn(
+                model_id,
+                concept,
+                baseline_words=baseline_words,
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+            )
             for concept in concepts
         ]
         del model, tokenizer
@@ -366,6 +376,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--concepts", nargs="+", default=None, help="default: first --n-concepts")
     ap.add_argument("--n-concepts", type=int, default=10)
     ap.add_argument("--n-trials", type=int, default=20)
+    ap.add_argument(
+        "--baseline-file",
+        type=Path,
+        default=None,
+        help="newline-delimited baseline words; blank lines and # comments are ignored",
+    )
     ap.add_argument("--out", type=Path, default=Path("results/records.jsonl"))
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--depth-fraction", type=float, default=DEPTH_FRACTION)
@@ -390,9 +406,15 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     concepts = args.concepts if args.concepts is not None else _default_concepts(args.n_concepts)
+    baseline_words = (
+        load_baseline_words(args.baseline_file)
+        if args.baseline_file is not None
+        else BASELINE_WORDS
+    )
     result = run_ladder(
         args.models,
         concepts=concepts,
+        baseline_words=baseline_words,
         seeds=args.seeds,
         n_trials=args.n_trials,
         out_path=args.out,

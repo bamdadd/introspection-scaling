@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from introspection_scaling import runner as runner_mod
-from introspection_scaling.extract import ConceptVector
+from introspection_scaling.extract import BASELINE_WORDS, ConceptVector
 from introspection_scaling.records import SeedRecord
 from introspection_scaling.runner import LadderRun, run_ladder
 
@@ -29,6 +29,7 @@ class _Recorder:
         self.gen_completion_calls: list[dict] = []
         self.judge_calls: list[list] = []
         self.loads: list[tuple] = []
+        self.baseline_words: list[tuple[str, ...]] = []
         self.gen_calls: list[tuple] = []
         self.written: list = []
         self.trials_written: list = []
@@ -40,8 +41,9 @@ class _Recorder:
         self.events.append(f"load:{model_id}")
         return (f"model:{model_id}", "tok")
 
-    def extract(self, model_id, concept, *, model, tokenizer, device):
+    def extract(self, model_id, concept, *, baseline_words, model, tokenizer, device):
         assert model == f"model:{model_id}"  # uses the Phase-1 loaded model
+        self.baseline_words.append(baseline_words)
         return _fake_cv(model_id, concept)
 
     def make_generator(self, model_id, dtype, quant):
@@ -155,6 +157,14 @@ def test_default_precision_is_float32(tmp_path: Path) -> None:
     assert all(dtype == "float32" and quant is None for _, dtype, quant in rec.loads)
 
 
+def test_baseline_words_threaded_to_extract(tmp_path: Path) -> None:
+    rec = _Recorder()
+    custom_words = ("ocean", "cloud")
+    _run(rec, tmp_path / "records.jsonl", baseline_words=custom_words)
+
+    assert rec.baseline_words == [custom_words] * (len(_MODELS) * len(_CONCEPTS))
+
+
 def test_two_phase_extract_generate_then_judge(tmp_path: Path) -> None:
     rec = _Recorder()
     _run(rec, tmp_path / "records.jsonl")
@@ -245,6 +255,8 @@ def test_cli_seam_threads_args(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr(runner_mod, "run_ladder", fake_run_ladder)
     out = tmp_path / "records.jsonl"
+    baseline = tmp_path / "baseline.txt"
+    baseline.write_text("ocean\ncloud\nocean\n")
     rc = runner_mod.main(
         [
             "--models",
@@ -260,6 +272,8 @@ def test_cli_seam_threads_args(monkeypatch, tmp_path: Path) -> None:
             "7",
             "--out",
             str(out),
+            "--baseline-file",
+            str(baseline),
         ]
     )
     assert rc == 0
@@ -270,3 +284,17 @@ def test_cli_seam_threads_args(monkeypatch, tmp_path: Path) -> None:
     assert captured["out_path"] == out
     assert captured["depth_fraction"] == pytest.approx(0.61)
     assert captured["dose_fraction"] == pytest.approx(0.044)
+    assert captured["baseline_words"] == ("ocean", "cloud")
+
+
+def test_cli_uses_builtin_baseline_words_by_default(monkeypatch, tmp_path: Path) -> None:
+    captured: dict = {}
+
+    def fake_run_ladder(models, **kwargs):
+        captured.update(kwargs)
+        return LadderRun(records=[], ran=list(models))
+
+    monkeypatch.setattr(runner_mod, "run_ladder", fake_run_ladder)
+    runner_mod.main(["--models", "Qwen/Qwen2.5-0.5B-Instruct", "--out", str(tmp_path / "out")])
+
+    assert captured["baseline_words"] == BASELINE_WORDS
