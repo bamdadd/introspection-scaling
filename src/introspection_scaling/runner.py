@@ -40,6 +40,8 @@ from .extract import (
     make_random_matched,
 )
 from .harness import (
+    DEFAULT_STRENGTH_K,
+    DOSE_MODE_DEFAULT,
     AnthropicJudge,
     MissingJudgeCredentialsError,
     RepengGenerator,
@@ -55,7 +57,12 @@ if TYPE_CHECKING:
 
 # orch-2 injection parameters (see module docstring / RESULTS.md).
 DEPTH_FRACTION = 0.61
+# Dose defaults. 'resid_frac' (committed orch-2 behaviour) = DOSE_FRACTION * resid
+# norm. 'raw_norm' (paper) = STRENGTH_K * ||raw diff-of-means||; STRENGTH_K pinned
+# a priori to the paper's canonical self-report injection strength of 2.
+DOSE_MODE = DOSE_MODE_DEFAULT
 DOSE_FRACTION = 0.044
+STRENGTH_K = DEFAULT_STRENGTH_K
 
 #: model_id -> (dtype, quant). dtype ∈ {float16, bfloat16, float32}; quant ∈
 #: {None, "nf4"}. This is the SHARED CONTRACT threaded to A1 `extract` (via the
@@ -209,7 +216,9 @@ def run_ladder(
     # offline re-judge. Written beside the counts when set. None = counts only.
     trials_path: str | Path | None = None,
     depth_fraction: float = DEPTH_FRACTION,
+    dose_mode: str = DOSE_MODE,
     dose_fraction: float = DOSE_FRACTION,
+    strength_k: float = STRENGTH_K,
     device: str = "cpu",
     judge: JudgeLike | None = None,
     allow_rule_based_judge: bool = False,
@@ -303,7 +312,9 @@ def run_ladder(
                     seeds=seeds,
                     n_trials=n_trials,
                     depth_fraction=depth_fraction,
+                    dose_mode=dose_mode,
                     dose_fraction=dose_fraction,
+                    strength_k=strength_k,
                     random_matched_fn=random_matched_fn,
                 )
             )
@@ -358,7 +369,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=Path("results/records.jsonl"))
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--depth-fraction", type=float, default=DEPTH_FRACTION)
+    ap.add_argument(
+        "--dose-mode",
+        choices=["resid_frac", "raw_norm"],
+        default=DOSE_MODE,
+        help="resid_frac (default)=fraction*resid_norm; raw_norm=k*||raw diff|| (paper)",
+    )
     ap.add_argument("--dose-fraction", type=float, default=DOSE_FRACTION)
+    ap.add_argument(
+        "--strength-k",
+        type=float,
+        default=STRENGTH_K,
+        help="raw_norm dose strength (paper canonical = 2); ignored in resid_frac mode",
+    )
     ap.add_argument(
         "--allow-rule-based-judge",
         action="store_true",
@@ -374,7 +397,9 @@ def main(argv: list[str] | None = None) -> int:
         n_trials=args.n_trials,
         out_path=args.out,
         depth_fraction=args.depth_fraction,
+        dose_mode=args.dose_mode,
         dose_fraction=args.dose_fraction,
+        strength_k=args.strength_k,
         device=args.device,
         allow_rule_based_judge=args.allow_rule_based_judge,
     )

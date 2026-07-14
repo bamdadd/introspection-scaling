@@ -403,8 +403,18 @@ def run_anchor_72b(concepts: list[str], seeds: list[int], n_trials: int = 12) ->
     secrets=_SECRETS,
     timeout=6 * 3600,
 )
-def run_calibration(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+def run_calibration(
+    concepts: list[str],
+    seeds: list[int],
+    n_trials: int = 12,
+    dose_mode: str = "raw_norm",
+    strength_k: float = 2.0,
+) -> dict[str, object]:
     """One-off fp16 calibration on Coder-32B (human-authorized single run).
+
+    Uses the CORRECTED paper dose: ``dose_mode='raw_norm'``, ``strength_k=2``
+    (the paper's canonical self-report injection strength, PINNED A PRIORI — one
+    value, no sweep). alpha = 2 * ||raw diff-of-means|| at the injection layer.
 
     FIT CHECK FIRST: load the fp16 RepengGenerator and take one resid-norm forward
     pass. If it OOMs / can't run, return ``fit_ok=False`` and run NO sweep (no
@@ -452,7 +462,8 @@ def run_calibration(concepts: list[str], seeds: list[int], n_trials: int = 12) -
         out_path=CALIBRATION_RECORDS,
         trials_path=f"{_RESULTS_DIR}/trials_coder32b.jsonl",  # re-judgeable raw layer
         depth_fraction=0.61,
-        dose_fraction=0.044,
+        dose_mode=dose_mode,  # 'raw_norm' (paper dose) for the Coder validation
+        strength_k=strength_k,  # k=2 pinned a priori
         device="cuda",
         precision_map=PRECISION_MAP,
         cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
@@ -475,7 +486,10 @@ def run_calibration(concepts: list[str], seeds: list[int], n_trials: int = 12) -
 
 @app.local_entrypoint()
 def calibration(n_concepts: int = 6, n_trials: int = 12) -> None:
-    """`modal run modal_app.py::calibration` — Coder-32B fp16 calibration ($10 cap)."""
+    """`modal run modal_app.py::calibration` — Coder-32B fp16 calibration ($10 cap).
+
+    Uses the CORRECTED paper dose (dose_mode='raw_norm', k=2 pinned a priori).
+    """
     from introspection_scaling.extract import CONCEPT_WORDS
 
     concepts = list(CONCEPT_WORDS[:n_concepts])
