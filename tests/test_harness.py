@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from introspection_scaling.harness import (
+    DEFAULT_STRENGTH_K,
     DEPTH_FRACTION_DEFAULT,
     DOSE_FRACTION_CEILING,
     DOSE_FRACTION_DEFAULT,
@@ -790,3 +791,60 @@ def test_bedrock_grade_many_preserves_order():
 def test_make_judge_unknown_backend_raises():
     with pytest.raises(ValueError, match="unknown JUDGE_BACKEND"):
         make_judge("gemini")
+
+
+# --- dose modes: resid_frac (default) vs raw_norm (paper) ------------------- #
+
+
+def test_dose_mode_raw_norm_computes_k_times_raw_norm():
+    # alpha = strength_k * cv.raw_norms[layer]; residual norm is IGNORED here
+    cv = make_cv(layer=4)  # raw_norms[4] = 3.0
+    gen = BatchGenerator(concept=cv.concept, n_layers=8, resid_norm=999.0)
+    comps = generate_concept_completions(
+        cv,
+        generator=gen,
+        seeds=[0],
+        n_trials=1,
+        depth_fraction=0.5,  # layer_for_fraction(8, 0.5) -> 4
+        dose_mode="raw_norm",
+        strength_k=2.0,
+        random_matched_fn=fake_random_matched,
+    )
+    assert all(c.layer == 4 for c in comps)
+    assert all(c.alpha == pytest.approx(2.0 * 3.0) for c in comps)  # k * raw_norm, not resid
+    assert all(c.resid_norm is None and c.dose_fraction is None for c in comps)
+
+
+def test_dose_mode_resid_frac_is_default_and_unchanged():
+    cv = make_cv(layer=4)
+    gen = BatchGenerator(concept=cv.concept, n_layers=8, resid_norm=200.0)
+    comps = generate_concept_completions(
+        cv,
+        generator=gen,
+        seeds=[0],
+        n_trials=1,
+        depth_fraction=0.5,
+        dose_fraction=0.044,
+        random_matched_fn=fake_random_matched,
+    )
+    # default mode still doses off the measured residual norm
+    assert all(c.alpha == pytest.approx(0.044 * 200.0) for c in comps)
+    assert all(c.resid_norm == 200.0 and c.dose_fraction == 0.044 for c in comps)
+
+
+def test_default_strength_k_is_paper_canonical_2():
+    assert DEFAULT_STRENGTH_K == pytest.approx(2.0)
+
+
+def test_dose_mode_unknown_raises():
+    cv = make_cv(layer=4)
+    gen = BatchGenerator(concept=cv.concept, n_layers=8)
+    with pytest.raises(ValueError, match="unknown dose_mode"):
+        generate_concept_completions(
+            cv,
+            generator=gen,
+            seeds=[0],
+            depth_fraction=0.5,
+            dose_mode="bogus",
+            random_matched_fn=fake_random_matched,
+        )
