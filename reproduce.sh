@@ -22,7 +22,9 @@ mkdir -p results
 # introspection_scaling.runner.run_ladder drives A1 extraction + A2 harness and
 # emits SeedRecord JSONL (raw n_success / n_trials). Controls are handled inside
 # run_concept: injected + no_injection + random_direction (SPEC, non-negotiable).
-# Injection params (orch-2): depth 0.61, dose alpha = 0.044 * resid_norm.
+# Injection params: depth 0.61; dose defaults to the paper's absolute strength
+# (dose_mode=raw_norm, alpha = 2 * ||raw diff-of-means||) — the corrected regime.
+# Override with --dose-mode resid_frac for the superseded residual-relative dose.
 #   Local dev (0.5B, CPU): the command below (small n-trials/concepts for speed).
 #   Full ladder (GPU)    : modal run modal_app.py::ladder   (A100-80GB; needs
 #                          huggingface-secret + anthropic-secret).

@@ -16,8 +16,10 @@ Orchestration only — the science lives in A1 (`extract`) and A2 (`harness`):
 vectors first (they're tiny), free the model, then build the generator — peak
 ≈ 56 GB, fits an A100-80GB. This is why the Modal ladder is sized 80GB.
 
-**Injection parameters (orch-2):** depth fraction **0.61**, dose fraction
-**0.044** (α = 0.044 · measured residual-stream norm). Threaded explicitly.
+**Injection parameters:** depth fraction **0.61**; dose defaults to the paper's
+absolute strength **α = k · ‖raw diff-of-means‖** with **k = 2** (``dose_mode=
+'raw_norm'``, the corrected/published regime). The superseded residual-relative
+dose (``'resid_frac'``, α = 0.044·‖resid‖) stays available as an explicit option.
 
 **Dependency-injected seam.** The real A1 (`extract`) and A2 (`harness`) callables
 are the defaults; every collaborator is also an injectable parameter, so the
@@ -59,9 +61,9 @@ if TYPE_CHECKING:
 
 # orch-2 injection parameters (see module docstring / RESULTS.md).
 DEPTH_FRACTION = 0.61
-# Dose defaults. 'resid_frac' (committed orch-2 behaviour) = DOSE_FRACTION * resid
-# norm. 'raw_norm' (paper) = STRENGTH_K * ||raw diff-of-means||; STRENGTH_K pinned
-# a priori to the paper's canonical self-report injection strength of 2.
+# Dose defaults. DEFAULT = 'raw_norm' (paper) = STRENGTH_K * ||raw diff-of-means||,
+# STRENGTH_K = 2 (paper canonical self-report strength). 'resid_frac' (superseded
+# steerbench regime) = DOSE_FRACTION * resid norm, available as an explicit option.
 DOSE_MODE = DOSE_MODE_DEFAULT
 DOSE_FRACTION = 0.044
 STRENGTH_K = DEFAULT_STRENGTH_K
@@ -389,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
         "--dose-mode",
         choices=["resid_frac", "raw_norm"],
         default=DOSE_MODE,
-        help="resid_frac (default)=fraction*resid_norm; raw_norm=k*||raw diff|| (paper)",
+        help="raw_norm (default)=k*||raw diff|| (paper); resid_frac=fraction*resid_norm",
     )
     ap.add_argument("--dose-fraction", type=float, default=DOSE_FRACTION)
     ap.add_argument(

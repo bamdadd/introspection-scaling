@@ -294,6 +294,7 @@ def test_run_concept_doses_alpha_from_measured_resid_norm():
         judge=RuleBasedJudge(),
         seeds=[0, 1, 2],
         depth_fraction=0.5,
+        dose_mode="resid_frac",  # this test exercises the residual-relative dose
         dose_fraction=0.044,
         random_matched_fn=fake_random_matched,
     )
@@ -317,6 +318,7 @@ def test_run_concept_refuses_over_ceiling_dose():
             generator=gen,
             judge=RuleBasedJudge(),
             seeds=[0],
+            dose_mode="resid_frac",  # the coherence-cliff ceiling is a resid_frac guard
             dose_fraction=0.12,
             random_matched_fn=fake_random_matched,
         )
@@ -699,6 +701,7 @@ def test_generate_concept_completions_doses_and_batches():
         seeds=[0, 1, 2],
         n_trials=2,
         depth_fraction=0.5,
+        dose_mode="resid_frac",
         dose_fraction=0.044,
         random_matched_fn=fake_random_matched,
     )
@@ -814,7 +817,27 @@ def test_make_judge_unknown_backend_raises():
         make_judge("gemini")
 
 
-# --- dose modes: resid_frac (default) vs raw_norm (paper) ------------------- #
+# --- dose modes: raw_norm (default, paper) vs resid_frac (superseded) ------- #
+
+
+def test_dose_mode_default_is_raw_norm_k2():
+    # #28: the committed DEFAULT dose is the corrected paper regime.
+    from introspection_scaling.harness import DOSE_MODE_DEFAULT
+
+    assert DOSE_MODE_DEFAULT == "raw_norm"
+    cv = make_cv(layer=4)  # raw_norms[4] = 3.0
+    gen = BatchGenerator(concept=cv.concept, n_layers=8, resid_norm=999.0)
+    comps = generate_concept_completions(  # NO dose_mode -> uses the default
+        cv,
+        generator=gen,
+        seeds=[0],
+        n_trials=1,
+        depth_fraction=0.5,  # layer_for_fraction(8, 0.5) -> 4
+        random_matched_fn=fake_random_matched,
+    )
+    # default dose = k(=2) * raw_norm[layer] = 6.0; residual (999) is IGNORED
+    assert all(c.alpha == pytest.approx(2.0 * 3.0) for c in comps)
+    assert all(c.resid_norm is None and c.dose_fraction is None for c in comps)
 
 
 def test_dose_mode_raw_norm_computes_k_times_raw_norm():
@@ -836,7 +859,8 @@ def test_dose_mode_raw_norm_computes_k_times_raw_norm():
     assert all(c.resid_norm is None and c.dose_fraction is None for c in comps)
 
 
-def test_dose_mode_resid_frac_is_default_and_unchanged():
+def test_dose_mode_resid_frac_still_works_when_requested():
+    # superseded mode is kept available as an explicit opt-in (not removed).
     cv = make_cv(layer=4)
     gen = BatchGenerator(concept=cv.concept, n_layers=8, resid_norm=200.0)
     comps = generate_concept_completions(
@@ -845,10 +869,11 @@ def test_dose_mode_resid_frac_is_default_and_unchanged():
         seeds=[0],
         n_trials=1,
         depth_fraction=0.5,
+        dose_mode="resid_frac",
         dose_fraction=0.044,
         random_matched_fn=fake_random_matched,
     )
-    # default mode still doses off the measured residual norm
+    # explicit resid_frac doses off the measured residual norm
     assert all(c.alpha == pytest.approx(0.044 * 200.0) for c in comps)
     assert all(c.resid_norm == 200.0 and c.dose_fraction == 0.044 for c in comps)
 
