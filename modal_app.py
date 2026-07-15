@@ -148,6 +148,34 @@ CALIBRATION_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct"
 CALIBRATION_RECORDS = f"{_RESULTS_DIR}/records_coder32b.jsonl"
 CALIBRATION_CAP_USD = 10.0
 
+# Coder-32B validation rung at the corrected paper dose (raw_norm, k=2). Modal
+# GENERATES transcripts only; the authoritative judge is the LOCAL Bedrock judge
+# (AWS SSO is local, not portable to Modal). SEPARATE _k2 path — must NOT touch
+# the suspect records_coder32b.jsonl. HARD $3 cap; est 0.7h so the guard's
+# projection ($2.8) stays under the cap and the single rung actually starts.
+CODER_K2_RECORDS = f"{_RESULTS_DIR}/records_coder32b_k2.jsonl"
+CODER_K2_TRIALS = f"{_RESULTS_DIR}/trials_coder32b_k2.jsonl"
+CODER_K2_CAP_USD = 3.0
+CODER_K2_STRENGTH_K = 2.0
+CODER_K2_RUNG_HOURS = {CALIBRATION_MODEL: 0.7}
+
+# Corrected-dose FULL Qwen ladder (raw_norm k=2). Same generate-on-Modal /
+# judge-locally-with-Bedrock split. SEPARATE _k2 path. GPU cap $15. Per-rung
+# estimates are REALISTIC (based on the actual fp16 costs, biased slightly high)
+# — the biased-high RUNG_GPU_HOURS would false-trip the guard before 32B at a $15
+# cap, so use tighter values here. The guard still stops if a rung runs wildly over.
+LADDER_K2_RECORDS = f"{_RESULTS_DIR}/records_ladder_k2.jsonl"
+LADDER_K2_TRIALS = f"{_RESULTS_DIR}/trials_ladder_k2.jsonl"
+LADDER_K2_CAP_USD = 15.0
+LADDER_K2_RUNG_HOURS: dict[str, float] = {
+    "Qwen/Qwen2.5-0.5B-Instruct": 0.2,
+    "Qwen/Qwen2.5-1.5B-Instruct": 0.25,
+    "Qwen/Qwen2.5-3B-Instruct": 0.3,
+    "Qwen/Qwen2.5-7B-Instruct": 0.35,
+    "Qwen/Qwen2.5-14B-Instruct": 0.5,
+    "Qwen/Qwen2.5-32B-Instruct": 0.7,
+}
+
 # Per-model precision (SHARED CONTRACT). <=32B -> fp16; 72B anchor -> bf16 + nf4.
 PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     **{m: ("float16", None) for m in QWEN_LADDER + LLAMA_LADDER},
@@ -482,6 +510,198 @@ def run_calibration(
         "spent_usd_gpu": round(result.spent_usd, 2),
         "fit_resid_norm": round(resid_norm, 2),
     }
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=2 * 3600,
+)
+def run_coder_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """GENERATE-ONLY Coder-32B transcripts at the corrected paper dose (raw_norm,
+    k=2). The authoritative judge is the LOCAL Bedrock judge (AWS SSO is local);
+    the RuleBasedJudge here is a NON-authoritative placeholder so PR#24 can persist
+    the transcripts. Committed result = local Bedrock re-judge of these transcripts.
+
+    Fit-check first: log the ACTUAL alpha (= k·‖raw diff-of-means‖ at the 0.61
+    layer) and one ``verify_injection_delta`` so the dose is observably LIVE (not a
+    no-op / coherence-destroyer) — observe, do NOT tune. $3 cap; separate _k2 path.
+    """
+    import gc
+
+    import torch
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.harness import RepengGenerator, RuleBasedJudge, layer_for_fraction
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    # --- FIT CHECK + DOSE OBSERVABILITY (observe, never tune) ---
+    # ONE model resident at a time (32B fp16 ~64 GB; two copies OOM an 80 GB A100):
+    # Phase 1 extract (fp16) -> free -> Phase 2 generator + verify -> free.
+    from introspection_scaling.runner import _load_causal_lm
+
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    try:
+        emodel, etok = _load_causal_lm(CALIBRATION_MODEL, "cuda", "float16", None)
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        cv = extract_concept_vector(
+            CALIBRATION_MODEL, "oceans", model=emodel, tokenizer=etok, device="cuda"
+        )
+        del emodel, etok
+        _free()
+        if layer not in cv.raw_norms:
+            raise RuntimeError(f"raw_norms missing injection layer {layer}")
+        raw_norm = float(cv.raw_norms[layer])
+        alpha = CODER_K2_STRENGTH_K * raw_norm
+        gen = RepengGenerator(
+            CALIBRATION_MODEL, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        )
+        diag = {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+        del gen, cv
+        _free()
+    except Exception as exc:  # noqa: BLE001 - report the fit/dose failure, run no sweep
+        return {
+            "fit_ok": False,
+            "model_id": CALIBRATION_MODEL,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    print(
+        f"[dose] layer={layer} raw_norm={raw_norm:.3f} k={CODER_K2_STRENGTH_K} alpha={alpha:.3f} "
+        f"ratio={diag['magnitude_ratio']:.3f} cos={diag['cosine_to_v_unit']:.3f}"
+    )
+
+    # --- Generate (RuleBasedJudge PLACEHOLDER; transcripts are the payload) ---
+    result = _run(
+        [CALIBRATION_MODEL],
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=CODER_K2_RECORDS,
+        trials_path=CODER_K2_TRIALS,
+        depth_fraction=0.61,
+        dose_mode="raw_norm",
+        strength_k=CODER_K2_STRENGTH_K,
+        device="cuda",
+        precision_map=PRECISION_MAP,
+        judge=RuleBasedJudge(),  # NON-authoritative; real verdict = local Bedrock re-judge
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=CODER_K2_CAP_USD,
+        rung_gpu_hours=CODER_K2_RUNG_HOURS,
+        on_model_done=_results_vol.commit,
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "fit_ok": True,
+        "dose": {
+            "layer": layer,
+            "raw_norm": round(raw_norm, 3),
+            "k": CODER_K2_STRENGTH_K,
+            "alpha": round(alpha, 3),
+            **{k: round(v, 3) for k, v in diag.items()},
+        },
+        "trials_out": CODER_K2_TRIALS,
+        "n_trials_persisted": len(result.records),
+        "ran": result.ran,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+        "note": "Modal verdicts are placeholders; authoritative = local Bedrock re-judge",
+    }
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=6 * 3600,
+)
+def run_ladder_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """GENERATE-ONLY the full Qwen ladder (0.5-32B) at the corrected paper dose
+    (raw_norm, k=2). Transcripts judged LOCALLY by the faithful Bedrock judge.
+
+    run_ladder's per-rung two-phase (extract fp16 -> free -> generate) IS the
+    one-model-at-a-time fit-check; records + transcripts are written and the volume
+    committed AFTER each rung, so an OOM/crash on a later rung keeps the earlier
+    rungs' transcripts (partial ladder still judgeable). $15 GPU cost guard.
+    """
+    from introspection_scaling.harness import RuleBasedJudge
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    models = list(QWEN_LADDER)  # 0.5/1.5/3/7/14/32B — no Llama, no 72B
+    try:
+        result = _run(
+            models,
+            concepts=concepts,
+            seeds=seeds,
+            n_trials=n_trials,
+            out_path=LADDER_K2_RECORDS,
+            trials_path=LADDER_K2_TRIALS,
+            depth_fraction=0.61,
+            dose_mode="raw_norm",
+            strength_k=CODER_K2_STRENGTH_K,  # k=2, same a-priori pin as the Coder run
+            device="cuda",
+            precision_map=PRECISION_MAP,
+            judge=RuleBasedJudge(),  # NON-authoritative; real verdict = local Bedrock re-judge
+            cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+            cost_cap_usd=LADDER_K2_CAP_USD,
+            rung_gpu_hours=LADDER_K2_RUNG_HOURS,
+            on_model_done=_results_vol.commit,
+        )
+    except Exception as exc:  # noqa: BLE001 - persist partial, report which rung broke
+        _results_vol.commit()
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "note": "partial ladder persisted to the volume; earlier rungs' transcripts survive",
+            "trials_out": LADDER_K2_TRIALS,
+        }
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "trials_out": LADDER_K2_TRIALS,
+        "n_trials_persisted": len(result.records),
+        "ran": result.ran,
+        "skipped_by_cost_guard": result.skipped,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+        "note": "Modal verdicts are placeholders; authoritative = local Bedrock re-judge",
+    }
+
+
+@app.local_entrypoint()
+def ladder_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::ladder_k2` — generate the corrected-dose Qwen ladder
+    (raw_norm k=2, $15 GPU cap). Judge LOCALLY afterwards (scripts/ladder_k2_judge.py)."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_ladder_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("ladder_k2:", result)
+
+
+@app.local_entrypoint()
+def coder_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::coder_k2` — generate Coder-32B transcripts (raw_norm
+    k=2, $3 cap). Judge LOCALLY with Bedrock afterwards (scripts/coder32b_k2_judge.py)."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_coder_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("coder_k2:", result)
 
 
 @app.local_entrypoint()
