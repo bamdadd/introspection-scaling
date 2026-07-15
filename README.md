@@ -4,15 +4,18 @@
 > Reproduce concept-injection detection, then chart detection rate vs
 > parameter count across two model-size ladders.
 
-![Detection rate vs parameter count — Qwen2.5-Instruct 0.5–32B. Injected-concept
-detection and both controls (no-injection, random-matched) sit at 0 across the
-whole ladder: no concept-injection introspection emerges at or below 32B.](results/scaling_curve.png)
+![Corrected-dose detection vs parameter count. Every Qwen2.5-Instruct rung from
+0.5B to 32B stays at 0 correct-identification even at the paper's dose, while
+Qwen2.5-Coder-32B rises above both controls at 32B. Introspective detection tracks
+the fine-tune, not parameter count.](results/scaling_curve_k2.png)
 
-> ⚠️ **Correction in progress (2026-07-14).** The curve above used a **sub-threshold
-> injection dose**. At the corrected dose (`α = 2·‖raw diff-of-means‖`) with a
-> working, fails-loud judge, **Qwen2.5-Coder-32B-Instruct reproduces the effect**
-> (above-chance detection, 2.3% vs 0% both controls). The null curve is **superseded /
-> under-dosed**; a corrected-dose ladder is re-running. See [RESULTS.md](RESULTS.md).
+> **Corrected-dose result (2026-07-14).** Injecting at the paper's absolute strength
+> (`α = 2·‖raw diff-of-means‖`) with a fails-loud judge, **Qwen2.5-Coder-32B reproduces
+> the effect** (above-chance, 2.3% vs 0% both controls, non-overlapping 95% CIs), while
+> every Qwen2.5-Instruct rung 0.5B to 32B stays null. Same size, same dose: detection
+> tracks the **fine-tune, not parameter count**. Our earlier "clean null ≤32B" used a
+> sub-threshold dose and is **withdrawn as under-dosed**; the original plot is kept at
+> `results/scaling_curve.png` for transparency. Full write-up in [RESULTS.md](RESULTS.md).
 
 **Original (superseded) result:** across Qwen2.5-Instruct 0.5→32B, injected-concept
 detection was **0/216 at every rung — and so were both controls.** Read as

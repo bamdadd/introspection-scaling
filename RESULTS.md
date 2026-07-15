@@ -8,10 +8,12 @@
 > detection** (2.3%, 5/216, vs 0.0% for both controls; non-overlapping 95% CIs) —
 > i.e. **the pipeline does reproduce the effect.** The "failed to reproduce" and
 > "≤32B clean null" claims below are therefore **withdrawn as under-dosed /
-> superseded.** A corrected-dose ladder is re-running and will replace these
-> numbers; the original artifacts are kept below for transparency.
+> superseded.** The corrected-dose ladder is complete and shown below; the original
+> under-dosed numbers are kept further down for transparency.
 
-![scaling curve](results/scaling_curve.png)
+![Corrected-dose scaling curve: every Qwen2.5-Instruct rung is a flat null from 0.5B
+to 32B, while Qwen2.5-Coder-32B sits above both controls at 32B. Detection tracks the
+fine-tune, not parameter count.](results/scaling_curve_k2.png)
 
 ## Finding
 
