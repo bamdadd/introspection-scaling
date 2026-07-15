@@ -94,8 +94,25 @@ and narrows the candidates:
 The clean way to separate legibility from suppression is cheap and needs no new
 generation: **logit-lens the injected concept inside Instruct-32B.** If the concept is
 linearly decodable from the activations but the model will not say it, that is
-suppression. If it is not cleanly decodable, that is legibility. That is the next
-experiment.
+suppression. If it is not cleanly decodable, that is legibility.
+
+**We ran it, and the answer is legibility.** Projecting the injected residual (same
+injection, k=2, layer 39) through the model's own unembedding, injection sharply
+raises the injected concept token in Coder-32B (median rank ~30k to ~4k, sustained
++2 to +2.5 logit-lift over no-injection, several concepts reaching the top few). In
+Instruct-32B the concept stays illegible: rank no better than no-injection, and worse
+than a matched-random direction, with roughly zero lift. So the dissociation is a
+legibility difference introduced by fine-tuning, not a persona gate. Instruct fails to
+report the concept because the injected direction is not decodable at the readout (which
+matches its 47%-affirmative, 0%-correct-id behaviour: it detects a perturbation but
+cannot resolve its identity), while Coder's code-heavy post-training makes injected
+concept directions linearly legible. Forward-pass only, $0.16 GPU, no judge. Data:
+`results/logit_lens_*.json`.
+
+![Logit-lens decodability of the injected concept: in Coder-32B injection lifts the
+concept token far up the model's own next-token ranking, while in Instruct-32B it stays
+as illegible as no injection. The dissociation is a legibility difference from
+post-training.](results/logit_lens_k2.png)
 
 ## Method (corrected dose)
 
@@ -125,7 +142,9 @@ experiment.
   claim. It needs more Instruct / Coder / Base pairs across sizes before it earns the
   word "finding" without a hedge.
 - **The Coder-32B effect is modest** (2.3%) and rests on a single a-priori dose.
-- **The logit-lens follow-up** that would explain the dissociation is not done yet.
+- **The mechanism is one probe.** The logit-lens result (legibility, not suppression)
+  is a single decodability measure on 10 single-token concepts; a fuller mechanistic
+  account (which layers, which features) is still open.
 - **72B and Llama-3.x** are not in the corrected ladder. The finding is about
   fine-tune, not scale, so extending scale is a low priority; a Base-model rung at
   each size would be more informative than a bigger one.
