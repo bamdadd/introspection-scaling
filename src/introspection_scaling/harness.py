@@ -625,13 +625,16 @@ DOSE_FRACTION_DEFAULT = 0.044  # sweet spot 0.033-0.055
 DOSE_FRACTION_CEILING = 0.09
 
 # Dose modes:
-#   'resid_frac' (default) — alpha = dose_fraction * measured residual-stream norm
-#                            (orch-2 steerbench regime; the committed behaviour).
-#   'raw_norm'             — alpha = strength_k * ||raw diff-of-means|| at the layer
-#                            (cv.raw_norms[layer]). Reproduces the PAPER's absolute
-#                            "inject strength * v_raw" on our unit directions.
+#   'raw_norm' (DEFAULT) — alpha = strength_k * ||raw diff-of-means|| at the layer
+#                          (cv.raw_norms[layer]). Reproduces the PAPER's absolute
+#                          "inject strength * v_raw" on our unit directions. This is
+#                          the corrected, published regime (the diagnosis showed the
+#                          old residual-relative dose was ~4-16x too weak).
+#   'resid_frac'         — alpha = dose_fraction * measured residual-stream norm
+#                          (superseded orch-2 steerbench regime). Kept as an explicit
+#                          option; NOT the default.
 # The paper's canonical self-report injection strength is 2 — pinned a priori.
-DOSE_MODE_DEFAULT = "resid_frac"
+DOSE_MODE_DEFAULT = "raw_norm"
 DEFAULT_STRENGTH_K = 2.0
 
 # Injection depth = 0.61 fraction-of-depth (layer = round(0.61 * N_layers)).
@@ -849,9 +852,9 @@ def resolve_dose(
     """Compute the injected norm ``alpha`` for a dose mode. Returns
     ``(alpha, resid_norm)`` (``resid_norm`` is None in raw_norm mode).
 
-    - ``'resid_frac'``: alpha = dose_fraction * measured resid norm (default).
-    - ``'raw_norm'``:  alpha = strength_k * ||raw diff-of-means|| at the layer
-      (``cv.raw_norms[layer]``) — the paper's absolute strength.
+    - ``'raw_norm'`` (default): alpha = strength_k * ||raw diff-of-means|| at the
+      layer (``cv.raw_norms[layer]``) — the paper's absolute strength.
+    - ``'resid_frac'``: alpha = dose_fraction * measured resid norm (superseded).
     """
     if dose_mode == "raw_norm":
         if layer not in cv.raw_norms:
@@ -882,9 +885,9 @@ def generate_concept_completions(
     """GPU phase for one concept: pick layer by depth, dose alpha per
     ``dose_mode``, then generate all completions (no judging).
 
-    ``dose_mode='resid_frac'`` (default) = committed orch-2 behaviour;
-    ``dose_mode='raw_norm'`` = paper absolute strength (alpha = strength_k *
-    ``cv.raw_norms[layer]``). The runner frees the GPU, then judges off-GPU.
+    ``dose_mode='raw_norm'`` (DEFAULT) = paper absolute strength (alpha =
+    strength_k * ``cv.raw_norms[layer]``); ``dose_mode='resid_frac'`` = superseded
+    residual-relative dose. The runner frees the GPU, then judges off-GPU.
     """
     layer = layer_for_fraction(generator.n_layers, depth_fraction)
     alpha, resid_norm = resolve_dose(
