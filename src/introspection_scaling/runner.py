@@ -117,14 +117,18 @@ class LadderRun:
 
 
 def _default_generator(
-    model_id: str, dtype: str, quant: str | None, *, device: str
+    model_id: str, dtype: str, quant: str | None, *, device: str, max_new_tokens: int = 200
 ) -> DoseGeneratorLike:
     """Build A2's RepengGenerator at the requested precision (SHARED CONTRACT).
 
     ``dtype`` / ``quant`` are now first-class on RepengGenerator, so no fp32
     fallback exists: the requested precision is used or the load raises.
+    ``max_new_tokens`` is forwarded directly; the default (200) matches
+    ``RepengGenerator``'s own default so existing behaviour is unchanged.
     """
-    gen: DoseGeneratorLike = RepengGenerator(model_id, device=device, dtype=dtype, quant=quant)
+    gen: DoseGeneratorLike = RepengGenerator(
+        model_id, device=device, dtype=dtype, quant=quant, max_new_tokens=max_new_tokens
+    )
     return gen
 
 
@@ -224,6 +228,7 @@ def run_ladder(
     dose_mode: str = DOSE_MODE,
     dose_fraction: float = DOSE_FRACTION,
     strength_k: float = STRENGTH_K,
+    max_new_tokens: int = 200,
     device: str = "cpu",
     judge: JudgeLike | None = None,
     allow_rule_based_judge: bool = False,
@@ -236,6 +241,8 @@ def run_ladder(
     clock: Callable[[], float] = time.monotonic,
     on_model_done: Callable[[], None] = _noop,
     # Injected seams — defaults are the real A1/A2 callables (see module docstring).
+    # A caller-supplied make_generator is fully in charge of its own generation
+    # length; max_new_tokens is only forwarded on the default-generator path.
     extract_fn: ExtractFn = extract_concept_vector,
     make_generator: GeneratorFactory | None = None,
     generate_completions_fn: GenerateCompletionsFn = generate_concept_completions,
@@ -259,7 +266,7 @@ def run_ladder(
     """
 
     def _default_gen(model_id: str, dtype: str, quant: str | None) -> DoseGeneratorLike:
-        return _default_generator(model_id, dtype, quant, device=device)
+        return _default_generator(model_id, dtype, quant, device=device, max_new_tokens=max_new_tokens)
 
     gen_factory: GeneratorFactory = make_generator if make_generator is not None else _default_gen
     resolved_judge = _resolve_judge(judge, allow_rule_based=allow_rule_based_judge)
@@ -401,6 +408,13 @@ def main(argv: list[str] | None = None) -> int:
         help="raw_norm dose strength (paper canonical = 2); ignored in resid_frac mode",
     )
     ap.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=200,
+        help="maximum tokens generated per trial (default 200); ignored when a custom"
+        " make_generator is supplied",
+    )
+    ap.add_argument(
         "--allow-rule-based-judge",
         action="store_true",
         help="opt into the NON-faithful keyword judge when no Anthropic key (flagged, not silent)",
@@ -424,6 +438,7 @@ def main(argv: list[str] | None = None) -> int:
         dose_mode=args.dose_mode,
         dose_fraction=args.dose_fraction,
         strength_k=args.strength_k,
+        max_new_tokens=args.max_new_tokens,
         device=args.device,
         allow_rule_based_judge=args.allow_rule_based_judge,
     )
