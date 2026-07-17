@@ -159,6 +159,16 @@ CODER_K2_CAP_USD = 3.0
 CODER_K2_STRENGTH_K = 2.0
 CODER_K2_RUNG_HOURS = {CALIBRATION_MODEL: 0.7}
 
+# Base-model rung at the same corrected dose (raw_norm, k=2) as run_coder_k2 —
+# Qwen2.5-32B BASE (NO fine-tune) so Base vs Instruct vs Coder is comparable at
+# 32B. Same generate-on-Modal / judge-locally-with-Bedrock split. SEPARATE _k2
+# path; HARD $3 cap; est 0.7h so the guard projection ($2.8) stays under the cap.
+BASE_MODEL_K2 = "Qwen/Qwen2.5-32B"
+BASE_K2_RECORDS = f"{_RESULTS_DIR}/records_base32b_k2.jsonl"
+BASE_K2_TRIALS = f"{_RESULTS_DIR}/trials_base32b_k2.jsonl"
+BASE_K2_CAP_USD = 3.0
+BASE_K2_RUNG_HOURS = {BASE_MODEL_K2: 0.7}
+
 # Corrected-dose FULL Qwen ladder (raw_norm k=2). Same generate-on-Modal /
 # judge-locally-with-Bedrock split. SEPARATE _k2 path. GPU cap $15. Per-rung
 # estimates are REALISTIC (based on the actual fp16 costs, biased slightly high)
@@ -180,6 +190,7 @@ LADDER_K2_RUNG_HOURS: dict[str, float] = {
 PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     **{m: ("float16", None) for m in QWEN_LADDER + LLAMA_LADDER},
     CALIBRATION_MODEL: ("float16", None),  # explicit: default would be float32 (OOMs 32B)
+    BASE_MODEL_K2: ("float16", None),  # 32B base, same fp16 contract as the Coder rung
     HELD_ANCHOR_72B: ("bfloat16", "nf4"),
 }
 
@@ -206,6 +217,8 @@ RUNG_GPU_HOURS: dict[str, float] = {
     # Coder-32B calibration: same size as Qwen 32B-Instruct (actual ~$1.12); 2.4h
     # is biased-high yet projects $9.6 < the $10 cap so the guard allows the start.
     CALIBRATION_MODEL: 2.4,
+    # Base-32B rung: same size as the Coder rung; biased-high mirror of its 2.4h.
+    BASE_MODEL_K2: 2.4,
 }
 
 # 72B anchor records go to a SEPARATE volume path — write_records opens mode 'w'
@@ -611,6 +624,115 @@ def run_coder_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> d
             **{k: round(v, 3) for k, v in diag.items()},
         },
         "trials_out": CODER_K2_TRIALS,
+        "n_trials_persisted": len(result.records),
+        "ran": result.ran,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+        "note": "Modal verdicts are placeholders; authoritative = local Bedrock re-judge",
+    }
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=2 * 3600,
+)
+def run_base_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """GENERATE-ONLY Qwen2.5-32B BASE transcripts at the corrected paper dose
+    (raw_norm, k=2) — the same corrected dose as run_coder_k2, so Base vs Instruct
+    vs Coder is comparable at 32B. The authoritative judge is the LOCAL Bedrock
+    judge (AWS SSO is local); the RuleBasedJudge here is a NON-authoritative
+    placeholder so the transcripts persist. Committed result = local Bedrock
+    re-judge of these transcripts.
+
+    Fit-check first: log the ACTUAL alpha (= k·‖raw diff-of-means‖ at the 0.61
+    layer) and one ``verify_injection_delta`` so the dose is observably LIVE (not a
+    no-op / coherence-destroyer) — observe, do NOT tune. $3 cap; separate _k2 path.
+    """
+    import gc
+
+    import torch
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.harness import RepengGenerator, RuleBasedJudge, layer_for_fraction
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    # --- FIT CHECK + DOSE OBSERVABILITY (observe, never tune) ---
+    # ONE model resident at a time (32B fp16 ~64 GB; two copies OOM an 80 GB A100):
+    # Phase 1 extract (fp16) -> free -> Phase 2 generator + verify -> free.
+    from introspection_scaling.runner import _load_causal_lm
+
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    try:
+        emodel, etok = _load_causal_lm(BASE_MODEL_K2, "cuda", "float16", None)
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        cv = extract_concept_vector(
+            BASE_MODEL_K2, "oceans", model=emodel, tokenizer=etok, device="cuda"
+        )
+        del emodel, etok
+        _free()
+        if layer not in cv.raw_norms:
+            raise RuntimeError(f"raw_norms missing injection layer {layer}")
+        raw_norm = float(cv.raw_norms[layer])
+        alpha = CODER_K2_STRENGTH_K * raw_norm
+        gen = RepengGenerator(
+            BASE_MODEL_K2, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        )
+        diag = {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+        del gen, cv
+        _free()
+    except Exception as exc:  # noqa: BLE001 - report the fit/dose failure, run no sweep
+        return {
+            "fit_ok": False,
+            "model_id": BASE_MODEL_K2,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    print(
+        f"[dose] layer={layer} raw_norm={raw_norm:.3f} k={CODER_K2_STRENGTH_K} alpha={alpha:.3f} "
+        f"ratio={diag['magnitude_ratio']:.3f} cos={diag['cosine_to_v_unit']:.3f}"
+    )
+
+    # --- Generate (RuleBasedJudge PLACEHOLDER; transcripts are the payload) ---
+    result = _run(
+        [BASE_MODEL_K2],
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=BASE_K2_RECORDS,
+        trials_path=BASE_K2_TRIALS,
+        depth_fraction=0.61,
+        dose_mode="raw_norm",
+        strength_k=CODER_K2_STRENGTH_K,
+        device="cuda",
+        precision_map=PRECISION_MAP,
+        judge=RuleBasedJudge(),  # NON-authoritative; real verdict = local Bedrock re-judge
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=BASE_K2_CAP_USD,
+        rung_gpu_hours=BASE_K2_RUNG_HOURS,
+        on_model_done=_results_vol.commit,
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "fit_ok": True,
+        "dose": {
+            "layer": layer,
+            "raw_norm": round(raw_norm, 3),
+            "k": CODER_K2_STRENGTH_K,
+            "alpha": round(alpha, 3),
+            **{k: round(v, 3) for k, v in diag.items()},
+        },
+        "trials_out": BASE_K2_TRIALS,
         "n_trials_persisted": len(result.records),
         "ran": result.ran,
         "stopped_reason": result.stopped_reason,
