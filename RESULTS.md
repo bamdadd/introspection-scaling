@@ -15,6 +15,12 @@
 > failed reproduction, both from a **sub-threshold dose** — see the
 > [Superseded](#superseded-original-under-dosed-run) appendix.)
 
+![Strict correct-identification per (size, variant) with percentile-bootstrap 95% CI
+bars. Discrete markers, no fitted trend line. Every variant sits on the 0.000 floor at
+7B and 14B; one Coder point lifts at 32B (filled = above both controls). One
+above-chance cell (Coder-32B, 5/216); it does not replicate down the Coder size ladder
+(Coder-7B 0/216, Coder-14B 1/216). Coder = Coder-{7,14,32}B-Instruct.](results/scaling_trend_k2.png)
+
 ## Finding
 
 **No Qwen2.5 model from 7B to 32B shows robust introspective concept-detection.**

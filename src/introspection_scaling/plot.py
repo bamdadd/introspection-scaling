@@ -23,6 +23,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless / CI-safe; no display required
 import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.ticker import NullFormatter  # noqa: E402
 
 from .stats import ModelPoint  # noqa: E402
 
@@ -171,6 +172,131 @@ def plot_scaling_curve(
         "matched-norm (dashed). Filled marker = injected\nband clears BOTH "
         "controls (above chance); open marker = not distinguishable from chance.\n"
         "Rates pooled over concepts; band = percentile bootstrap over ≥3 seeds."
+    )
+    fig.text(0.5, -0.02, caption_text, ha="center", va="top", fontsize=8, wrap=True)
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+#: Post-training variants of the size trend, in legend order, with plot colors.
+#: "coder" = Qwen2.5-Coder-*-Instruct (code-post-trained *instruct*), the
+#: code-post-training arm of a same-size base / general-instruct / code-instruct
+#: contrast — NOT a base-vs-instruct axis.
+_VARIANT_STYLE: dict[str, tuple[str, str]] = {
+    "base": ("Qwen2.5 (base)", "#7f7f7f"),
+    "instruct": ("Qwen2.5-Instruct (general)", "#1f77b4"),
+    "coder": ("Qwen2.5-Coder-Instruct (code)", "#2ca02c"),
+}
+
+
+def plot_variant_trend(
+    series: Mapping[str, Sequence[tuple[float, ModelPoint]]],
+    out_path: str | Path = "results/scaling_trend_k2.png",
+    *,
+    n_trials: int = 216,
+    title: str = "Introspective detection across size and post-training",
+    caption: str | None = None,
+) -> Path:
+    """Render the honest size-trend hero: discrete (size, variant) points with
+    bootstrap 95% CI bars, filled marker = above chance.
+
+    ``series`` maps a variant key (``base`` / ``instruct`` / ``coder``) to its
+    ``(param_count_B, ModelPoint)`` points. We deliberately draw **markers only,
+    no connecting line** — three points per family do not justify a fitted trend,
+    and the paper text explicitly disclaims one. Both controls are 0.000 on every
+    rung, so they are shown as a single flat reference at zero rather than nine
+    redundant bands. The story is visual: every variant flat-zero at 7B/14B, one
+    Coder point lifted at 32B — non-replication made visible.
+    """
+    if not series:
+        raise ValueError("no series to plot")
+
+    fig, ax = plt.subplots(figsize=(8.0, 5.5))
+
+    # Dodge the three variants around each size tick so overlapping zeros stay
+    # legible on the log-x axis (multiplicative offset = symmetric in log space).
+    dodge = {"base": 1.0 / 1.08, "instruct": 1.0, "coder": 1.08}
+
+    for variant, (label, color) in _VARIANT_STYLE.items():
+        pts = series.get(variant)
+        if not pts:
+            continue
+        off = dodge.get(variant, 1.0)
+        xs = [size * off for size, _ in pts]
+        means = [p.injected.mean for _, p in pts]
+        lo = [p.injected.mean - p.injected.ci_low for _, p in pts]
+        hi = [p.injected.ci_high - p.injected.mean for _, p in pts]
+        # CI bars, no line (fmt="none"); markers drawn separately per point so
+        # above-chance ones can be filled and the rest left open.
+        ax.errorbar(xs, means, yerr=[lo, hi], fmt="none", ecolor=color, capsize=4, zorder=2)
+        ax.plot([], [], "o", color=color, label=label)  # legend proxy
+        for x, (_, p) in zip(xs, pts, strict=True):
+            ax.plot(
+                [x],
+                [p.injected.mean],
+                marker="o",
+                markersize=9,
+                markerfacecolor=color if p.above_chance else "white",
+                markeredgecolor=color,
+                markeredgewidth=1.8,
+                zorder=4,
+            )
+            if p.injected.mean > 0.0:
+                n_succ = round(p.injected.mean * n_trials)
+                ax.annotate(
+                    f"{n_succ}/{n_trials}",
+                    (x, p.injected.mean),
+                    textcoords="offset points",
+                    xytext=(9, 0),
+                    va="center",
+                    fontsize=8,
+                    color=color,
+                )
+
+    ax.axhline(0.0, ls="--", color="#555555", lw=1.2, alpha=0.8, zorder=1)
+    ax.annotate(
+        "no-injection & random-direction controls: 0.000 on every rung",
+        (0.5, 0.0),
+        xycoords=("axes fraction", "data"),
+        textcoords="offset points",
+        xytext=(0, 5),
+        ha="center",
+        fontsize=8,
+        color="#555555",
+    )
+
+    ax.set_xscale("log")
+    sizes = sorted({size for pts in series.values() for size, _ in pts})
+    ax.set_xticks(sizes)
+    ax.set_xticklabels([f"{s:g}B" for s in sizes])
+    # Kill the log minor ticks/labels (e.g. "3x10^1") that otherwise collide with
+    # the clean 7B/14B/32B major labels.
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="x", which="minor", length=0)
+    ax.set_xlim(min(sizes) / 1.25, max(sizes) * 1.25)
+    ax.set_xlabel("Parameter count (log scale)")
+    ax.set_ylabel(f"Strict correct-id rate (of {n_trials} trials)")
+    # Zoom near the floor so the lone ~0.023 Coder-32B point and its CI are visible.
+    top = max(
+        (p.injected.ci_high for pts in series.values() for _, p in pts),
+        default=0.03,
+    )
+    ax.set_ylim(-0.002, max(0.035, top * 1.25))
+    ax.set_title(title)
+    ax.grid(True, which="both", axis="y", alpha=0.25)
+    ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
+
+    caption_text = caption or (
+        "Strict correct-identification (coherent AND correct-id) per (size, variant), "
+        "with percentile-bootstrap\n95% CI over seeds. Markers only — no trend line is "
+        "fitted through three points. Filled = above both\ncontrols; open = not "
+        "distinguishable from chance. One above-chance cell (Coder-32B, 5/216); it does "
+        "not\nreplicate down the Coder size ladder (Coder-7B 0/216, Coder-14B 1/216). "
+        "Coder = Coder-{7,14,32}B-Instruct."
     )
     fig.text(0.5, -0.02, caption_text, ha="center", va="top", fontsize=8, wrap=True)
 
