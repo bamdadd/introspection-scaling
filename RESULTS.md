@@ -38,11 +38,18 @@ Two results, and the second is the important one:
 
    | Model (32B, same dose) | correct-id | affirmative | coherent | above chance? |
    |------------------------|:----------:|:-----------:|:--------:|:-------------:|
+   | Qwen2.5-32B (base)     | 0.000      | 0.449       | 0.491    | no            |
    | Qwen2.5-32B-Instruct   | 0.000      | 0.472       | 0.944    | no            |
    | Qwen2.5-Coder-32B      | **0.023**  | 0.310       | 0.770    | **yes**       |
 
    Same parameter count, same dose, same everything except post-training. The
-   code-tuned model can report the injected concept; the chat-tuned one cannot.
+   code-tuned model can report the injected concept; the base and chat-tuned ones
+   cannot. The base rung is the control that matters: it rules out both parameter
+   count (all three are 32B) and fine-tuning in general (Instruct is a fine-tune and
+   is null too). What is left is specific: code-heavy post-training buys the
+   legibility, which is exactly what the logit-lens shows. Base behaves like Instruct
+   (affirms an injected thought ~45% of the time, never names it), $0.78 GPU, single
+   a-priori dose, no sweep.
 
 There is also a method result worth stating on its own: open-model concept-injection
 introspection is **dose-fragile**. A dose chosen for coherent steering sits well
