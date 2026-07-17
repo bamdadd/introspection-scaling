@@ -1,8 +1,7 @@
 # introspection-scaling
 
 > **Does the ability to introspect on injected concepts emerge with scale?**
-> Reproduce concept-injection detection, then chart detection rate vs
-> parameter count across two model-size ladders.
+> A faithful reproduction of [Emergent Introspective Awareness in Large Language Models](https://transformer-circuits.pub/2025/introspection/index.html) (Lindsey, Anthropic, 2025; [arXiv](https://arxiv.org/abs/2601.01828)), charting concept-injection detection against parameter count across model-size ladders.
 
 ![Corrected-dose detection vs parameter count. Every Qwen2.5-Instruct rung from
 0.5B to 32B stays at 0 correct-identification even at the paper's dose, while
@@ -136,7 +135,7 @@ models, so instruct is the faithful analog; our companion steerbench study also
 reports instruct steering more cleanly than base (provisional, same caveat). We
 render the prompt with each model's native chat template.
 
-[steerbench]: # "companion steering-dose study — link when published"
+[steerbench]: https://github.com/bamdadd/steerbench
 
 ## Rigor bar
 3+ seeds · mean ± std on every point · pinned lockfile · fixed seeds ·
