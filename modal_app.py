@@ -827,6 +827,17 @@ def coder_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
 
 
 @app.local_entrypoint()
+def base_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::base_k2` — generate Qwen2.5-32B base transcripts
+    (raw_norm k=2, $3 cap). Judge LOCALLY with Bedrock afterwards (scripts/base32b_k2_judge.py)."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_base_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("base_k2:", result)
+
+
+@app.local_entrypoint()
 def calibration(n_concepts: int = 6, n_trials: int = 12) -> None:
     """`modal run modal_app.py::calibration` — Coder-32B fp16 calibration ($10 cap).
 
