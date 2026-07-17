@@ -1,2 +1,6 @@
 model_id,gpu_usd,wall
+Qwen/Qwen2.5-7B,0.55,640s
+Qwen/Qwen2.5-14B,0.71,793s
+Qwen/Qwen2.5-Coder-7B-Instruct,0.42,490s
+Qwen/Qwen2.5-Coder-14B-Instruct,0.63,715s
 Qwen/Qwen2.5-Coder-32B-Instruct,0.78,~1 H100-hr

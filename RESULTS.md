@@ -1,55 +1,98 @@
 # Results
 
-> **Corrected-dose result (2026-07-14).** An earlier version of this file reported a
-> clean null through 32B and a failed reproduction. Both used a **sub-threshold
-> injection dose** (`α = 0.044·‖resid‖`, chosen for steering coherence, ~4 to 18x
-> below the paper's absolute strength). At the corrected dose
-> (`α = 2·‖raw diff-of-means‖`, the paper's regime) with a fails-loud judge,
-> **Qwen2.5-Coder-32B reproduces the effect** (2.3%, 5/216, above both controls,
-> non-overlapping 95% CIs), while every Qwen2.5-Instruct rung stays null. The old
-> under-dosed numbers are kept in the [Superseded](#superseded-original-under-dosed-run)
-> appendix for transparency.
-
-![Corrected-dose scaling curve: every Qwen2.5-Instruct rung is a flat null from 0.5B
-to 32B, while Qwen2.5-Coder-32B sits above both controls at 32B. Detection tracks the
-fine-tune, not parameter count.](results/scaling_curve_k2.png)
+> **Size-trend update (2026-07-17).** An earlier version of this file led with
+> *"introspective detection tracks the fine-tune, not the parameter count."*
+> **That headline is retracted.** Filling in the base and Coder rungs at 7B and 14B
+> shows the one above-chance cell — Qwen2.5-Coder-32B, 5/216 — does **not** replicate
+> down its own size ladder: Coder-7B is 0/216 and Coder-14B is 1/216, both with 95%
+> CIs overlapping the 0.000 controls. Within the Coder family, parameter count *does*
+> gate the effect. The corrected finding is a **conjunction** — code-heavy
+> post-training **and** ~32B scale — and the evidence for even that rests on a single
+> marginal cell. The 32B three-way comparison and the logit-lens mechanism below are
+> unchanged and still valid; only the "not parameter count" clause is now false.
+>
+> (Prior context: an even earlier version reported a clean null through 32B and a
+> failed reproduction, both from a **sub-threshold dose** — see the
+> [Superseded](#superseded-original-under-dosed-run) appendix.)
 
 ## Finding
 
-**At the paper's dose, introspective detection tracks the fine-tune, not the
-parameter count.** We went looking for a scaling threshold and found a
-post-training effect instead.
+**No Qwen2.5 model from 7B to 32B shows robust introspective concept-detection.**
+Across three post-training variants (base, general-instruct, code-instruct) at 7B,
+14B, and 32B, every rung is a null except one: Qwen2.5-Coder-32B-Instruct clears both
+controls at **5/216 (2.3%)**. That single cell does not survive its own size ladder —
+Coder-7B is 0/216, Coder-14B is 1/216 — so the honest reading is a **conjunction**
+(code-post-training AND ~32B scale), not a fine-tune main effect. We went looking for a
+scaling threshold, briefly thought we had a clean post-training effect, and on the full
+grid have neither: at most a necessary-but-not-sufficient role for code post-training,
+resting on one marginal cell.
 
-Two results, and the second is the important one:
+Lead with the negative. The trend table is the result:
 
-1. **The reproduction works.** Injecting at the paper's absolute strength
-   (`α = 2·‖raw diff-of-means‖`) with a fails-loud judge, Qwen2.5-Coder-32B scores
-   **0.023 (5/216)** injected-concept detection against **0.000** for both controls
-   (no-injection and random-matched), with non-overlapping 95% CIs. Modest, but real
-   and clean: the model sometimes notices and correctly names a concept that was
-   never in its input.
+| Model | Params (B) | Variant | correct-id (x/216) [95% CI] | affirmative | coherent | above chance? | GPU $ | wall |
+|-------|-----------:|---------|:---------------------------:|:-----------:|:--------:|:-------------:|------:|-----:|
+| Qwen2.5-7B            | 7  | base     | 0.000 (0/216) [0.000, 0.000]     | 0.204 | 0.218 | no      | 0.55 | 640s |
+| Qwen2.5-7B-Instruct   | 7  | instruct | 0.000 (0/216) [0.000, 0.000]     | 0.306 | 0.597 | no      | —    | —    |
+| Qwen2.5-Coder-7B      | 7  | coder    | 0.000 (0/216) [0.000, 0.000]     | 0.310 | 0.056 | no      | 0.42 | 490s |
+| Qwen2.5-14B           | 14 | base     | 0.000 (0/216) [0.000, 0.000]     | 0.074 | 0.412 | no      | 0.71 | 793s |
+| Qwen2.5-14B-Instruct  | 14 | instruct | 0.000 (0/216) [0.000, 0.000]     | 0.023 | 0.894 | no      | —    | —    |
+| Qwen2.5-Coder-14B     | 14 | coder    | 0.005 (1/216) [0.000, 0.014]     | 0.093 | 0.509 | no      | 0.63 | 715s |
+| Qwen2.5-32B           | 32 | base     | 0.000 (0/216) [0.000, 0.000]     | 0.449 | 0.491 | no      | —    | —    |
+| Qwen2.5-32B-Instruct  | 32 | instruct | 0.000 (0/216) [0.000, 0.000]     | 0.472 | 0.944 | no      | —    | —    |
+| Qwen2.5-Coder-32B     | 32 | coder    | **0.023 (5/216)** [0.014, 0.028] | 0.306 | 0.773 | **yes** | 0.78 | ~1 H100-hr |
 
-2. **The scaling ladder is flat, and that is the finding.** Every Qwen2.5-Instruct
-   rung from 0.5B to 32B stays at **0.000** correct-identification at the same
-   corrected dose. The dose is live, not inert: at 32B the Instruct model *affirms*
-   an injected thought 47% of the time under injection versus never without it. It
-   feels the perturbation. It just never names it. So the interesting contrast is not
-   on the ladder, it is between two same-size models:
+Each cell is **216 trials** (6 concepts x 12 trials x 3 seeds). `correct-id` is the
+strict score (`coherent AND correct-identification`), the same score the above-chance
+test runs on; raw counts are shown as `x/216`. `above chance?` is `injected.ci_low >
+max(control.ci_high)` on the percentile bootstrap over seeds — no new test, the same
+instrument the 32B rows were always scored with. Both controls (no-injection,
+random-matched) are 0.000 on every rung, so only the injected column is shown.
+**"Coder" = Qwen2.5-Coder-{7,14,32}B-Instruct** (code-post-trained *instruct* models,
+not base Coder weights): this is the code-post-training arm of a single-variable
+base / general-instruct / code-instruct contrast at matched size, **not** a
+base-vs-instruct axis. GPU $/wall are per-rung Modal A100-80GB fp16 (`—` = reused from
+a prior judged pass); the smaller Instruct rungs (0.5B–3B) are in the
+[coherence-floor note](#the-small-instruct-rungs-coherence-floor) below.
 
-   | Model (32B, same dose) | correct-id | affirmative | coherent | above chance? |
-   |------------------------|:----------:|:-----------:|:--------:|:-------------:|
-   | Qwen2.5-32B (base)     | 0.000      | 0.449       | 0.491    | no            |
-   | Qwen2.5-32B-Instruct   | 0.000      | 0.472       | 0.944    | no            |
-   | Qwen2.5-Coder-32B      | **0.023**  | 0.310       | 0.770    | **yes**       |
+Read the Coder column top to bottom — it is the whole retraction. 0/216, 1/216, 5/216
+as size goes 7B → 14B → 32B, and only the 32B cell clears its controls. The effect
+that looked like "post-training" appears **only** where code post-training meets ~32B
+scale; it is absent at the same fine-tune two sizes down. Two honest caveats on the
+non-replication cells, neither of which rescues the effect:
 
-   Same parameter count, same dose, same everything except post-training. The
-   code-tuned model can report the injected concept; the base and chat-tuned ones
-   cannot. The base rung is the control that matters: it rules out both parameter
-   count (all three are 32B) and fine-tuning in general (Instruct is a fine-tune and
-   is null too). What is left is specific: code-heavy post-training buys the
-   legibility, which is exactly what the logit-lens shows. Base behaves like Instruct
-   (affirms an injected thought ~45% of the time, never names it), $0.78 GPU, single
-   a-priori dose, no sweep.
+- **Coder-14B is 1/216, not 2/216.** Two trials correctly named the concept, but one
+  was incoherent and so fails the strict `coherent AND correct-identification` rule
+  (strict success = 1/216; raw correct-id = 2/216). Either way the 95% CI
+  `[0.000, 0.014]` overlaps the 0.000 controls — not above chance.
+- **Coder-7B's null is partly a broken-model null.** Under injection its coherence
+  *collapses* (0.972 → 0.056; see the coherent column, injected vs the 0.972
+  no-injection rate). A model that mostly emits incoherent text cannot score a strict
+  success, so its 0/216 is confounded by incoherence, not a clean "capable-but-silent"
+  null. The dose (k = 2) was pinned a-priori for the whole ladder and we do **not**
+  re-dose per rung, so we report this as a limitation rather than tuning it away.
+
+We do **not** run any trend / Cochran-Armitage / p-value test across sizes to rescue
+significance: three points per family with counts this small is badly underpowered, and
+fishing for a monotone trend there would be p-hacking. The claim is the raw pattern of
+counts, nothing inferential beyond the per-cell above-chance test.
+
+### The 32B cell up close
+
+The 32B three-way is where the one positive lives, and it stays the sharpest single
+comparison in the set — same parameter count, same dose, only post-training differs:
+
+| Model (32B, same dose) | correct-id | affirmative | coherent | above chance? |
+|------------------------|:----------:|:-----------:|:--------:|:-------------:|
+| Qwen2.5-32B (base)     | 0.000      | 0.449       | 0.491    | no            |
+| Qwen2.5-32B-Instruct   | 0.000      | 0.472       | 0.944    | no            |
+| Qwen2.5-Coder-32B      | **0.023**  | 0.306       | 0.773    | **yes**       |
+
+The dose is live, not inert: base and Instruct both *affirm* an injected thought ~45%
+of the time under injection versus never without it. They feel the perturbation; they
+just never name it. At 32B, and only at 32B, the code-tuned model can report the
+injected concept while the base and chat-tuned ones cannot — which is what the
+logit-lens below traces to a legibility difference. But read against the size ladder,
+this is one cell, not a main effect: the same Coder fine-tune is null at 7B and 14B.
 
 There is also a method result worth stating on its own: open-model concept-injection
 introspection is **dose-fragile**. A dose chosen for coherent steering sits well
@@ -59,34 +102,33 @@ measurement, not the detection score, exposed it. Anyone reproducing this line o
 work should calibrate the injection by the concept vector's own norm against the
 source paper's strength, and measure the perturbation directly before trusting a zero.
 
-## Corrected-dose ladder (Qwen2.5-Instruct, one A100-80GB, fp16)
+### The small Instruct rungs (coherence floor)
 
-Each cell is over **216 trials** (6 concepts x 12 trials x 3 seeds). Correct-id is the
-strict score (`coherent AND correct-identification`). Affirmative and coherent are the
-side signals that show the dose is doing something. Both controls (no-injection,
-random-matched) are 0.000 correct-id on every rung.
+The general-instruct ladder runs down to 0.5B; those rungs are 0.000 correct-id like
+the rest, but their nulls are partly a coherence floor and are kept separate from the
+7B–32B grid for that reason:
 
 | Model | Params (B) | correct-id [95% CI] | affirmative | coherent | above chance? |
 |-------|-----------:|:-------------------:|:-----------:|:--------:|:-------------:|
-| Qwen2.5-0.5B-Instruct | 0.5 | 0.000 [0.00, 0.00] | 0.130 | 0.005 | no |
-| Qwen2.5-1.5B-Instruct | 1.5 | 0.000 [0.00, 0.00] | 0.023 | 0.167 | no |
-| Qwen2.5-3B-Instruct | 3.0 | 0.000 [0.00, 0.00] | 0.176 | 0.861 | no |
-| Qwen2.5-7B-Instruct | 7.0 | 0.000 [0.00, 0.00] | 0.306 | 0.597 | no |
-| Qwen2.5-14B-Instruct | 14.0 | 0.000 [0.00, 0.00] | 0.023 | 0.894 | no |
-| Qwen2.5-32B-Instruct | 32.0 | 0.000 [0.00, 0.00] | 0.472 | 0.944 | no |
+| Qwen2.5-0.5B-Instruct | 0.5 | 0.000 [0.000, 0.000] | 0.130 | 0.005 | no |
+| Qwen2.5-1.5B-Instruct | 1.5 | 0.000 [0.000, 0.000] | 0.023 | 0.167 | no |
+| Qwen2.5-3B-Instruct   | 3.0 | 0.000 [0.000, 0.000] | 0.176 | 0.861 | no |
 
-Read across: coherence climbs with scale (0.5B is largely incoherent under the
-paper-strength dose, 0.5% coherent, so its null is a coherence floor, not a detection
-result), and by 32B the model is both coherent and frequently affirmative, yet still
-never correctly identifies the concept. Correct-identification is the wall.
+Coherence climbs with scale (0.5B is largely incoherent under the paper-strength dose,
+0.5% coherent, so its null is a coherence floor, not a detection result), and by 32B
+the Instruct model is both coherent and frequently affirmative, yet still never
+correctly identifies the concept. Correct-identification is the wall.
 
-## Why the Coder and not the Instruct
+## Why the Coder and not the Instruct (at 32B)
 
-We do not know for certain, and it is one model pair, so these are hypotheses.
+This section is about the **one positive cell** — Coder-32B vs base/Instruct at 32B. It
+explains why *that* cell clears its controls; it does not explain the size ladder, where
+the same Coder fine-tune is null at 7B and 14B. We do not know for certain, and it is one
+size point, so these are hypotheses.
 
-The sharp clue is *where* the two models differ: not in noticing (Instruct-32B affirms
-47% of the time) but in *naming*. That localizes the effect to the identification step
-and narrows the candidates:
+The sharp clue is *where* the models differ at 32B: not in noticing (base and
+Instruct-32B both affirm ~45% of the time) but in *naming*. That localizes the effect to
+the identification step and narrows the candidates:
 
 1. **Representation legibility (leading guess).** Code is compositional and structured,
    and heavy code post-training may produce cleaner, more linearly-readable features,
@@ -133,28 +175,50 @@ post-training.](results/logit_lens_k2.png)
   degraded or unavailable judge can never silently return a zero. `parse_error_rate = 0`
   on every rung, and the [positive control](#controls-floor-and-ceiling) passes on this
   judge.
+- **Variants:** `base` = Qwen2.5-{7,14,32}B, `instruct` = Qwen2.5-{...}B-Instruct,
+  `coder` = **Qwen2.5-Coder-{7,14,32}B-Instruct** (code-post-trained *instruct*, not base
+  Coder weights). Same size, same dose, only the post-training corpus differs.
 - **Seeds:** 0, 1, 2. **Hardware:** one Modal A100-80GB, fp16.
-- **Spend:** ~$4.3 GPU (A100-80GB) + ~$16 Bedrock judge (about 4,500 grades) ≈ **$20
-  total**. One judge batch hit a Bedrock throttle, failed loud, and was re-graded from
-  persisted transcripts at lower concurrency with no GPU re-spend.
-- **Raw data:** [`results/records_ladder_k2.jsonl`](results/records_ladder_k2.jsonl),
-  [`results/records_coder32b_k2.jsonl`](results/records_coder32b_k2.jsonl), and the
-  full judged transcripts in
-  [`results/trials_ladder_k2_bedrock.jsonl`](results/trials_ladder_k2_bedrock.jsonl)
-  and [`results/trials_coder32b_k2_bedrock.jsonl`](results/trials_coder32b_k2_bedrock.jsonl).
+- **Judge dates:** the Instruct ladder and the 32B base/Coder rungs were Bedrock-judged
+  on 2026-07-15; the new base/Coder 7B and 14B rungs on 2026-07-17. The `correct-id`
+  score is **verified non-drifting** across the two dates — re-deriving the counts from
+  the persisted transcripts reproduces the committed `records_*.jsonl` byte-for-value.
+  Only the side signals (affirmative/coherent) show sub-rounding movement between judge
+  passes (e.g. Coder-32B affirmative 0.310 → 0.306); the detection score and every
+  above-chance verdict are unchanged.
+- **Spend:** ~$4.3 (original ladder + 32B) + ~$2.3 (four new 7B/14B base/Coder rungs)
+  GPU ≈ **$6.6 GPU** + ~$16 Bedrock judge ≈ **$23 total**. One judge batch hit a Bedrock
+  throttle, failed loud, and was re-graded from persisted transcripts at lower
+  concurrency with no GPU re-spend.
+- **Regenerating this table:** one command over the judged trial files —
+  `uv run python scripts/trend_table.py results/trials_*_bedrock.jsonl --costs
+  results/rung_costs.csv` (runs `stats.model_points` per rung; no new CI or test).
+- **Raw data:** per-rung counts in `results/records_{ladder,base32b,coder32b,base7b,`
+  `base14b,coder7b,coder14b}_k2.jsonl` and the full judged transcripts in the matching
+  `results/trials_*_k2_bedrock.jsonl`.
 
 ## Limitations (stated before you ask)
 
-- **The dissociation is one model pair at one size.** It is an observation, not yet a
-  claim. It needs more Instruct / Coder / Base pairs across sizes before it earns the
-  word "finding" without a hedge.
-- **The Coder-32B effect is modest** (2.3%) and rests on a single a-priori dose.
-- **The mechanism is one probe.** The logit-lens result (legibility, not suppression)
-  is a single decodability measure on 10 single-token concepts; a fuller mechanistic
-  account (which layers, which features) is still open.
-- **72B and Llama-3.x** are not in the corrected ladder. The finding is about
-  fine-tune, not scale, so extending scale is a low priority; a Base-model rung at
-  each size would be more informative than a bigger one.
+- **The whole positive result is one cell.** Coder-32B at 5/216 (2.3%) is the only
+  above-chance point in the 3-variant × 3-size grid, it rests on a single a-priori dose,
+  and it does not replicate at 7B or 14B of the same fine-tune. Read it as *at most*
+  necessary-but-not-sufficient evidence for code post-training, not as an established
+  effect.
+- **Non-replication is not a clean null everywhere.** Coder-7B's 0/216 is confounded by
+  an injection-induced coherence collapse (0.972 → 0.056): a model emitting mostly
+  incoherent text cannot register a strict success, so that cell is partly a
+  broken-model null rather than a capable-but-silent one. The dose (k = 2) was pinned
+  a-priori across the whole ladder; we do not re-dose per rung.
+- **No inferential trend test.** With three sizes per family and counts this small, a
+  trend/Cochran-Armitage/p-value test would be underpowered and invite p-hacking. We
+  report raw counts and the per-cell above-chance test only.
+- **The mechanism is one probe, for one cell.** The logit-lens legibility result
+  explains the 32B Coder-vs-Instruct dissociation only; it is a single decodability
+  measure on 10 single-token concepts and does not speak to why the effect is absent at
+  smaller sizes.
+- **72B and Llama-3.x** are not in the corrected grid. Filling the base/Coder 7B–14B
+  cells (this update) was the higher-value direction; a 72B row of all three variants is
+  the natural next rung.
 - Everything is fp16 on a single A100.
 
 ## Controls (floor and ceiling)
