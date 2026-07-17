@@ -186,11 +186,44 @@ LADDER_K2_RUNG_HOURS: dict[str, float] = {
     "Qwen/Qwen2.5-32B-Instruct": 0.7,
 }
 
+# Small-model rungs at the SAME corrected dose (raw_norm k=2) as run_base_k2 /
+# run_coder_k2 — they fill in Base vs Coder-Instruct at 7B and 14B below the 32B
+# anchor. Same generate-on-Modal / judge-locally-with-Bedrock split; SEPARATE
+# per-model _k2 paths (never cross-wire a model to another's path). NONE are in
+# QWEN_LADDER, so each needs an EXPLICIT PRECISION_MAP + RUNG_GPU_HOURS entry: the
+# default precision would be float32 (breaks the fp16 contract), and a missing
+# GPU-hours est makes the cost guard project $0 and skip the projection.
+RUNG_K2_BASE_7B = "Qwen/Qwen2.5-7B"  # base (no fine-tune)
+RUNG_K2_BASE_14B = "Qwen/Qwen2.5-14B"  # base (no fine-tune)
+RUNG_K2_CODER_7B = "Qwen/Qwen2.5-Coder-7B-Instruct"  # coder = the -Instruct variant
+RUNG_K2_CODER_14B = "Qwen/Qwen2.5-Coder-14B-Instruct"  # coder = the -Instruct variant
+RUNG_K2_MODELS: tuple[str, ...] = (
+    RUNG_K2_BASE_7B,
+    RUNG_K2_BASE_14B,
+    RUNG_K2_CODER_7B,
+    RUNG_K2_CODER_14B,
+)
+RUNG_K2_CAP_USD = 3.0  # per-rung HARD cap, same as the Coder/Base 32B rungs
+RUNG_K2_RECORDS = {
+    RUNG_K2_BASE_7B: f"{_RESULTS_DIR}/records_base7b_k2.jsonl",
+    RUNG_K2_BASE_14B: f"{_RESULTS_DIR}/records_base14b_k2.jsonl",
+    RUNG_K2_CODER_7B: f"{_RESULTS_DIR}/records_coder7b_k2.jsonl",
+    RUNG_K2_CODER_14B: f"{_RESULTS_DIR}/records_coder14b_k2.jsonl",
+}
+RUNG_K2_TRIALS = {
+    RUNG_K2_BASE_7B: f"{_RESULTS_DIR}/trials_base7b_k2.jsonl",
+    RUNG_K2_BASE_14B: f"{_RESULTS_DIR}/trials_base14b_k2.jsonl",
+    RUNG_K2_CODER_7B: f"{_RESULTS_DIR}/trials_coder7b_k2.jsonl",
+    RUNG_K2_CODER_14B: f"{_RESULTS_DIR}/trials_coder14b_k2.jsonl",
+}
+
 # Per-model precision (SHARED CONTRACT). <=32B -> fp16; 72B anchor -> bf16 + nf4.
 PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     **{m: ("float16", None) for m in QWEN_LADDER + LLAMA_LADDER},
     CALIBRATION_MODEL: ("float16", None),  # explicit: default would be float32 (OOMs 32B)
     BASE_MODEL_K2: ("float16", None),  # 32B base, same fp16 contract as the Coder rung
+    # Small-model _k2 rungs: NOT in QWEN_LADDER -> explicit fp16 (default float32 breaks fp16).
+    **{m: ("float16", None) for m in RUNG_K2_MODELS},
     HELD_ANCHOR_72B: ("bfloat16", "nf4"),
 }
 
@@ -219,6 +252,13 @@ RUNG_GPU_HOURS: dict[str, float] = {
     CALIBRATION_MODEL: 2.4,
     # Base-32B rung: same size as the Coder rung; biased-high mirror of its 2.4h.
     BASE_MODEL_K2: 2.4,
+    # Small-model _k2 rungs (generate-only, single rung each). Biased-high yet each
+    # projects under the $3 per-rung cap so the guard STARTS the rung: 7B 0.4h->$1.6,
+    # 14B 0.7h->$2.8 (both < $3). A missing entry would default to 0.0 and skip the projection.
+    RUNG_K2_BASE_7B: 0.4,
+    RUNG_K2_BASE_14B: 0.7,
+    RUNG_K2_CODER_7B: 0.4,
+    RUNG_K2_CODER_14B: 0.7,
 }
 
 # 72B anchor records go to a SEPARATE volume path — write_records opens mode 'w'
@@ -741,6 +781,208 @@ def run_base_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> di
     }
 
 
+def _run_rung_k2(
+    model_id: str,
+    records_path: str,
+    trials_path: str,
+    cap_usd: float,
+    rung_hours_map: dict[str, float],
+    concepts: list[str],
+    seeds: list[int],
+    n_trials: int,
+) -> dict[str, object]:
+    """GENERATE-ONLY ``model_id`` transcripts at the corrected paper dose (raw_norm,
+    k=2) — the SAME corrected dose as run_base_k2 / run_coder_k2. Shared body for the
+    four small-model _k2 rungs (base 7B/14B, Coder-Instruct 7B/14B) so the
+    fit-check + dose observability + generate path lives in ONE place — this kills
+    the copy-paste bug class the four thin wrappers would otherwise reintroduce.
+
+    The authoritative judge is the LOCAL Bedrock judge (AWS SSO is local, not
+    portable to Modal); the RuleBasedJudge here is a NON-authoritative placeholder
+    so the transcripts persist. Committed result = local Bedrock re-judge.
+
+    Fit-check first: log the ACTUAL alpha (= k·‖raw diff-of-means‖ at the 0.61
+    layer) and one ``verify_injection_delta`` so the dose is observably LIVE (not a
+    no-op / coherence-destroyer) — observe, do NOT tune. Per-rung ``cap_usd``;
+    SEPARATE per-model ``records_path`` / ``trials_path`` (never cross-wired).
+    """
+    import gc
+
+    import torch
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.harness import RepengGenerator, RuleBasedJudge, layer_for_fraction
+    from introspection_scaling.runner import _load_causal_lm
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    # --- FIT CHECK + DOSE OBSERVABILITY (observe, never tune) ---
+    # Two-phase load (extract -> free -> generator + verify -> free), mirroring the
+    # 32B rungs. These 7B/14B models fit an 80 GB A100 with room to spare; the phased
+    # free is kept only for a uniform code path with run_base_k2 / run_coder_k2.
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    try:
+        emodel, etok = _load_causal_lm(model_id, "cuda", "float16", None)
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        cv = extract_concept_vector(model_id, "oceans", model=emodel, tokenizer=etok, device="cuda")
+        del emodel, etok
+        _free()
+        if layer not in cv.raw_norms:
+            raise RuntimeError(f"raw_norms missing injection layer {layer}")
+        raw_norm = float(cv.raw_norms[layer])
+        alpha = CODER_K2_STRENGTH_K * raw_norm
+        gen = RepengGenerator(
+            model_id, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        )
+        diag = {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+        del gen, cv
+        _free()
+    except Exception as exc:  # noqa: BLE001 - report the fit/dose failure, run no sweep
+        return {
+            "fit_ok": False,
+            "model_id": model_id,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    print(
+        f"[dose] model={model_id} layer={layer} raw_norm={raw_norm:.3f} k={CODER_K2_STRENGTH_K} "
+        f"alpha={alpha:.3f} ratio={diag['magnitude_ratio']:.3f} cos={diag['cosine_to_v_unit']:.3f}"
+    )
+
+    # --- Generate (RuleBasedJudge PLACEHOLDER; transcripts are the payload) ---
+    result = _run(
+        [model_id],
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=records_path,
+        trials_path=trials_path,
+        depth_fraction=0.61,
+        dose_mode="raw_norm",
+        strength_k=CODER_K2_STRENGTH_K,
+        device="cuda",
+        precision_map=PRECISION_MAP,
+        judge=RuleBasedJudge(),  # NON-authoritative; real verdict = local Bedrock re-judge
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=cap_usd,
+        rung_gpu_hours=rung_hours_map,
+        on_model_done=_results_vol.commit,
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "fit_ok": True,
+        "model_id": model_id,
+        "dose": {
+            "layer": layer,
+            "raw_norm": round(raw_norm, 3),
+            "k": CODER_K2_STRENGTH_K,
+            "alpha": round(alpha, 3),
+            **{k: round(v, 3) for k, v in diag.items()},
+        },
+        "trials_out": trials_path,
+        "n_trials_persisted": len(result.records),
+        "ran": result.ran,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+        "note": "Modal verdicts are placeholders; authoritative = local Bedrock re-judge",
+    }
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=2 * 3600,
+)
+def run_base7b_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """GENERATE-ONLY Qwen2.5-7B BASE transcripts (raw_norm k=2). See _run_rung_k2."""
+    m = RUNG_K2_BASE_7B
+    return _run_rung_k2(
+        m,
+        RUNG_K2_RECORDS[m],
+        RUNG_K2_TRIALS[m],
+        RUNG_K2_CAP_USD,
+        {m: RUNG_GPU_HOURS[m]},
+        concepts,
+        seeds,
+        n_trials,
+    )
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=2 * 3600,
+)
+def run_base14b_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """GENERATE-ONLY Qwen2.5-14B BASE transcripts (raw_norm k=2). See _run_rung_k2."""
+    m = RUNG_K2_BASE_14B
+    return _run_rung_k2(
+        m,
+        RUNG_K2_RECORDS[m],
+        RUNG_K2_TRIALS[m],
+        RUNG_K2_CAP_USD,
+        {m: RUNG_GPU_HOURS[m]},
+        concepts,
+        seeds,
+        n_trials,
+    )
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=2 * 3600,
+)
+def run_coder7b_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """GENERATE-ONLY Qwen2.5-Coder-7B-Instruct transcripts (raw_norm k=2). See _run_rung_k2."""
+    m = RUNG_K2_CODER_7B
+    return _run_rung_k2(
+        m,
+        RUNG_K2_RECORDS[m],
+        RUNG_K2_TRIALS[m],
+        RUNG_K2_CAP_USD,
+        {m: RUNG_GPU_HOURS[m]},
+        concepts,
+        seeds,
+        n_trials,
+    )
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=2 * 3600,
+)
+def run_coder14b_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """GENERATE-ONLY Qwen2.5-Coder-14B-Instruct transcripts (raw_norm k=2). See _run_rung_k2."""
+    m = RUNG_K2_CODER_14B
+    return _run_rung_k2(
+        m,
+        RUNG_K2_RECORDS[m],
+        RUNG_K2_TRIALS[m],
+        RUNG_K2_CAP_USD,
+        {m: RUNG_GPU_HOURS[m]},
+        concepts,
+        seeds,
+        n_trials,
+    )
+
+
 @app.function(
     image=_ladder_image,
     gpu="A100-80GB",
@@ -835,6 +1077,50 @@ def base_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
     concepts = list(CONCEPT_WORDS[:n_concepts])
     result = run_base_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
     print("base_k2:", result)
+
+
+@app.local_entrypoint()
+def base7b_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::base7b_k2` — generate Qwen2.5-7B base transcripts (raw_norm
+    k=2, $3 cap). Judge LOCALLY: scripts/rung_k2_judge.py results/trials_base7b_k2.jsonl."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_base7b_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("base7b_k2:", result)
+
+
+@app.local_entrypoint()
+def base14b_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::base14b_k2` — generate Qwen2.5-14B base transcripts (raw_norm
+    k=2, $3 cap). Judge LOCALLY: scripts/rung_k2_judge.py results/trials_base14b_k2.jsonl."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_base14b_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("base14b_k2:", result)
+
+
+@app.local_entrypoint()
+def coder7b_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::coder7b_k2` — generate Qwen2.5-Coder-7B-Instruct transcripts
+    (raw_norm k=2, $3 cap). Judge LOCALLY: scripts/rung_k2_judge.py trials_coder7b_k2.jsonl."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_coder7b_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("coder7b_k2:", result)
+
+
+@app.local_entrypoint()
+def coder14b_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::coder14b_k2` — generate Qwen2.5-Coder-14B-Instruct transcripts
+    (raw_norm k=2, $3 cap). Judge LOCALLY: scripts/rung_k2_judge.py trials_coder14b_k2.jsonl."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_coder14b_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("coder14b_k2:", result)
 
 
 @app.local_entrypoint()
