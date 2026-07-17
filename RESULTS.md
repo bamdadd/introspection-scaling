@@ -196,8 +196,12 @@ post-training.](results/logit_lens_k2.png)
   GPU ≈ **$6.6 GPU** + ~$16 Bedrock judge ≈ **$23 total**. One judge batch hit a Bedrock
   throttle, failed loud, and was re-graded from persisted transcripts at lower
   concurrency with no GPU re-spend.
-- **Regenerating this table:** one command over the judged trial files —
-  `uv run python scripts/trend_table.py results/trials_*_bedrock.jsonl --costs
+- **Regenerating this table:** `./reproduce.sh` rebuilds this table **and** the
+  figure `results/scaling_trend_k2.png` end-to-end from the committed
+  `*_bedrock.jsonl` (no GPU/Bedrock); `./reproduce.sh full` regenerates the raw
+  transcripts on Modal GPU and re-judges through Bedrock first. The table step
+  itself is a single command over the judged trial files — `uv run python
+  scripts/trend_table.py results/trials_*_bedrock.jsonl --costs
   results/rung_costs.csv` (runs `stats.model_points` per rung; no new CI or test).
 - **Raw data:** per-rung counts in `results/records_{ladder,base32b,coder32b,base7b,`
   `base14b,coder7b,coder14b}_k2.jsonl` and the full judged transcripts in the matching

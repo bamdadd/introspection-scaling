@@ -35,8 +35,10 @@ what scale does this appear, and how does it degrade as models shrink?**
 ## Quickstart
 ```bash
 uv sync                        # pinned env from uv.lock
-export ANTHROPIC_API_KEY=...    # the introspection judge
-./reproduce.sh                 # clean env → per-model detection rates + scaling curve
+./reproduce.sh                 # clean env → trend table + results/scaling_trend_k2.png
+                               #   (rebuilt from the committed Bedrock verdicts; no GPU, no cloud auth)
+./reproduce.sh full            # regenerate from zero: Modal A100 GPU + local Bedrock judge, then table + figure
+                               #   needs Modal auth and AWS Bedrock SSO; spends real money (script echoes the estimate)
 ```
 
 Or drive the pipeline directly:
