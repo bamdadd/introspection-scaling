@@ -16,7 +16,7 @@ the fine-tune, not parameter count.](results/scaling_curve_k2.png)
 > sub-threshold dose and is **withdrawn as under-dosed**; the original plot is kept at
 > `results/scaling_curve.png` for transparency. Full write-up in [RESULTS.md](RESULTS.md).
 
-**Write-up:** [Same size, different mind](https://bamdad.substack.com/p/same-size-different-mind) walks through the reproduction, the dosing bug that faked a null, and the fine-tune dissociation.
+**Write-up:** [Same size, different mind](https://bamdad.substack.com/p/same-size-different-mind) walks through the reproduction, the dosing bug that faked a null, and the fine-tune dissociation. The formal note (abstract, methods, results, limitations) is in [docs/note.md](docs/note.md).
 
 **Original (superseded) result:** across Qwen2.5-Instruct 0.5→32B, injected-concept
 detection was **0/216 at every rung — and so were both controls.** Read as
