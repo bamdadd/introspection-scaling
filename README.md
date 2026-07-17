@@ -3,18 +3,22 @@
 > **Does the ability to introspect on injected concepts emerge with scale?**
 > A faithful reproduction of [Emergent Introspective Awareness in Large Language Models](https://transformer-circuits.pub/2025/introspection/index.html) (Lindsey, Anthropic, 2025; [arXiv](https://arxiv.org/abs/2601.01828)), charting concept-injection detection against parameter count across model-size ladders.
 
-![Corrected-dose detection vs parameter count. Every Qwen2.5-Instruct rung from
-0.5B to 32B stays at 0 correct-identification even at the paper's dose, while
-Qwen2.5-Coder-32B rises above both controls at 32B. Introspective detection tracks
-the fine-tune, not parameter count.](results/scaling_curve_k2.png)
+![Strict correct-identification across size and post-training, with bootstrap 95% CI
+bars. Every base / general-instruct / code-instruct variant sits at 0 correct-id at 7B
+and 14B; only Qwen2.5-Coder-32B rises above both controls (5/216). The one above-chance
+cell does not replicate down the Coder size ladder.](results/scaling_trend_k2.png)
 
-> **Corrected-dose result (2026-07-14).** Injecting at the paper's absolute strength
-> (`α = 2·‖raw diff-of-means‖`) with a fails-loud judge, **Qwen2.5-Coder-32B reproduces
-> the effect** (above-chance, 2.3% vs 0% both controls, non-overlapping 95% CIs), while
-> every Qwen2.5-Instruct rung 0.5B to 32B stays null. Same size, same dose: detection
-> tracks the **fine-tune, not parameter count**. Our earlier "clean null ≤32B" used a
-> sub-threshold dose and is **withdrawn as under-dosed**; the original plot is kept at
-> `results/scaling_curve.png` for transparency. Full write-up in [RESULTS.md](RESULTS.md).
+> **Size-trend result (2026-07-17).** Across Qwen2.5 base, general-instruct, and
+> code-instruct variants from 7B to 32B, **no model shows robust introspective
+> detection.** Exactly one cell clears both controls — Qwen2.5-Coder-32B at 2.3%
+> (5/216) — and it does **not** replicate down its own size ladder (Coder-7B 0/216,
+> Coder-14B 1/216 strict, CIs overlapping the 0.000 controls). So the signal is a
+> **conjunction** — code-heavy post-training **and** ~32B scale — resting on a single
+> marginal cell, not a fine-tune main effect. (An earlier version led with "detection
+> tracks the fine-tune, not parameter count"; that is **retracted** — within the Coder
+> family, scale *does* gate the effect.) "Coder" = Qwen2.5-Coder-{7,14,32}B-Instruct.
+> The earlier "clean null ≤32B" used a sub-threshold dose and is separately withdrawn
+> as under-dosed. Full write-up in [RESULTS.md](RESULTS.md).
 
 **Write-up:** [Same size, different mind](https://bamdad.substack.com/p/same-size-different-mind) walks through the reproduction, the dosing bug that faked a null, and the fine-tune dissociation. The formal note (abstract, methods, results, limitations) is in [docs/note.md](docs/note.md).
 
