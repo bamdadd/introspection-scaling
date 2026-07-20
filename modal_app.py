@@ -231,6 +231,27 @@ MOE_K2_TRIALS = f"{_RESULTS_DIR}/trials_moe_k2.jsonl"
 MOE_K2_CAP_USD = 3.0
 MOE_K2_RUNG_HOURS = {MOE_MODEL_K2: 0.5}  # biased-high; ~2.7B active projects $2.0 < $3
 
+# Independent-replication rung for the flagship positive cell. DeepSeek-Coder-33B-
+# Instruct is a DENSE Llama-arch 33B — a THIRD-PARTY coder model at the IDENTICAL
+# pinned protocol as the Qwen Coder-32B rung (raw_norm k=2, depth 0.61, fp16). It
+# moves the n=1 Coder-positive cell to n=2 on a different model family. 33B fp16
+# ~66 GB fits one A100-80GB (same envelope as the 32B rungs). Same generate-on-
+# Modal / judge-locally-with-Bedrock split; judge reuses scripts/rung_k2_judge.py.
+# SEPARATE _k2 paths; HARD $3 cap. A cheap STEP-1 DENSE GATE (run_dense_gate) runs
+# FIRST to catch the Coder-7B coherence-collapse-under-dose failure mode before the
+# full rung is paid for.
+DEEPSEEK_MODEL_K2 = "deepseek-ai/deepseek-coder-33b-instruct"
+DEEPSEEK_K2_RECORDS = f"{_RESULTS_DIR}/records_deepseek33b_k2.jsonl"
+DEEPSEEK_K2_TRIALS = f"{_RESULTS_DIR}/trials_deepseek33b_k2.jsonl"
+DEEPSEEK_K2_CAP_USD = 3.0
+# Per-rung est is biased-high yet MUST project under the $3 cap or the guard never
+# starts the rung: 0.7h -> $2.8 < $3 (same envelope + same value as the base/coder
+# 32B rungs). This is the value PASSED to run_ladder. The GLOBAL RUNG_GPU_HOURS
+# entry below is a separate, harder-biased 1.0 — DeepSeek is in no ladder tuple, so
+# nothing projects against it; it exists only for map completeness.
+DEEPSEEK_K2_RUNG_HOURS = {DEEPSEEK_MODEL_K2: 0.7}
+DEEPSEEK_GATE_CAP_USD = 1.0  # STEP-1 gate; bounded by the 900 s timeout ($1 at $4/hr)
+
 # Per-model precision (SHARED CONTRACT). <=32B -> fp16; 72B anchor -> bf16 + nf4.
 PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     **{m: ("float16", None) for m in QWEN_LADDER + LLAMA_LADDER},
@@ -239,6 +260,9 @@ PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     # Small-model _k2 rungs: NOT in QWEN_LADDER -> explicit fp16 (default float32 breaks fp16).
     **{m: ("float16", None) for m in RUNG_K2_MODELS},
     MOE_MODEL_K2: ("float16", None),  # MoE probe, same fp16 contract (default would be float32)
+    # DeepSeek-Coder-33B replication: dense 33B fp16, same contract as the 32B rungs
+    # (NOT in QWEN_LADDER -> explicit fp16; default float32 would break the contract + OOM).
+    DEEPSEEK_MODEL_K2: ("float16", None),
     HELD_ANCHOR_72B: ("bfloat16", "nf4"),
 }
 
@@ -278,6 +302,10 @@ RUNG_GPU_HOURS: dict[str, float] = {
     # $2.0 < the $3 cap so the guard STARTS the rung; a missing entry would default
     # to 0.0 and skip the projection.
     MOE_MODEL_K2: 0.5,
+    # DeepSeek-Coder-33B replication (dense, ~33B, same A100-80GB envelope as the 32B
+    # rungs). Biased-high global est; NOT the value the guard projects against for the
+    # rung — run_deepseek_k2 passes the tighter DEEPSEEK_K2_RUNG_HOURS (0.7 -> $2.8 < $3).
+    DEEPSEEK_MODEL_K2: 1.0,
 }
 
 # 72B anchor records go to a SEPARATE volume path — write_records opens mode 'w'
@@ -988,6 +1016,259 @@ def run_moe_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dic
     }
 
 
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # DeepSeek ungated; NO judge secret on Modal
+    # STEP-1 gate: bounds cost to the $1 cap ($4/hr * 0.25h = 900 s). NOTE: weights
+    # MUST be pre-warmed in the HF cache volume — a first-run uncached ~66 GB download
+    # would blow this budget. Run the gate a second time (or warm the cache) if the
+    # first invocation times out on the download rather than the compute.
+    timeout=900,
+)
+def run_dense_gate(model_id: str = DEEPSEEK_MODEL_K2) -> dict[str, object]:
+    """STEP-1 GATE for a DENSE model (the dense analogue of run_moe_fitcheck, which
+    is MoE-only via ``router_shift``). Cheap, standalone, runs BEFORE the full rung.
+
+    Three checks, in order of cost:
+
+    1. ARCH CHECK (do NOT assert): log ``model_type`` + ``num_hidden_layers`` and
+       confirm repeng can attach — i.e. the loaded model exposes ``model.model.layers``
+       (the residual stack repeng's ``ControlModel`` wraps). If the hasattr chain is
+       absent (a custom arch), return ``{gate_ok: False, reason: 'repeng cannot
+       attach'}`` and STOP — do not extract, do not generate.
+    2. DOSE OBSERVABILITY: extract the ``oceans`` concept vector, take the injection
+       layer at depth 0.61, pin ``alpha = 2 * raw_norm`` (the corrected raw_norm k=2
+       dose), and run one ``verify_injection_delta`` -> ``magnitude_ratio`` (~1.0 means
+       repeng injects UNSCALED) + ``cosine``.
+    3. COHERENCE at the pinned dose (the load-bearing gate): generate a small handful
+       of completions on 2 concepts x 4 trials, BOTH control-OFF (no injection) and
+       control-ON (injected at the per-concept alpha), score each with the
+       ``RuleBasedJudge`` coherence heuristic, and report
+       ``coherence_rate_noinjection`` vs ``coherence_rate_injected``. A large drop ON
+       vs OFF is the Coder-7B failure mode (coherence collapse under dose) — catching
+       it here avoids paying for a full rung whose transcripts are all incoherent.
+
+    Two-phase load (extract -> free -> generator) so only one 33B copy is resident.
+    $1 cap (via the 900 s timeout). Prints every field. Runs no sweep, writes nothing.
+    """
+    import gc
+
+    import torch
+    from transformers import AutoConfig
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.extract import CONCEPT_WORDS
+    from introspection_scaling.harness import RepengGenerator, RuleBasedJudge, layer_for_fraction
+    from introspection_scaling.runner import _load_causal_lm
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # --- 1. ARCH CHECK (cheap config, no weights) ---
+    cfg = AutoConfig.from_pretrained(DEEPSEEK_MODEL_K2)
+    model_type = str(getattr(cfg, "model_type", "unknown"))
+    n_layers = int(cfg.num_hidden_layers)
+    print(f"[gate] model_type={model_type} n_layers={n_layers}")
+
+    # --- 2. DOSE OBSERVABILITY: extract (Phase 1) then verify + cohere (Phase 2) ---
+    concepts = ["oceans", CONCEPT_WORDS[0].lower()]  # oceans (primary, for the delta) + one more
+    try:
+        emodel, etok = _load_causal_lm(DEEPSEEK_MODEL_K2, "cuda", "float16", None)
+        # repeng attach check on the LIVE model (the hasattr chain ControlModel wraps).
+        if not (hasattr(emodel, "model") and hasattr(emodel.model, "layers")):
+            del emodel, etok
+            _free()
+            print("[gate] repeng cannot attach: no model.model.layers -> STOP")
+            return {
+                "gate_ok": False,
+                "reason": "repeng cannot attach",
+                "model_type": model_type,
+                "n_layers": n_layers,
+            }
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        # Extract a vector per coherence concept (raw_norm dose is per-concept).
+        cvs = {
+            c: extract_concept_vector(
+                DEEPSEEK_MODEL_K2, c, model=emodel, tokenizer=etok, device="cuda"
+            )
+            for c in concepts
+        }
+        del emodel, etok
+        _free()
+        for c, cv in cvs.items():
+            if layer not in cv.raw_norms:
+                raise RuntimeError(f"raw_norms missing injection layer {layer} for {c!r}")
+        cv_primary = cvs[concepts[0]]
+        raw_norm = float(cv_primary.raw_norms[layer])
+        alpha = 2.0 * raw_norm  # raw_norm k=2 dose (same corrected dose as the _k2 rungs)
+
+        # Phase 2: generator for verify + coherence. 48 tokens is enough for the
+        # coherence heuristic (>=2 words + repetition check) to see early collapse.
+        gen = RepengGenerator(
+            DEEPSEEK_MODEL_K2, device="cuda", dtype="float16", quant=None, max_new_tokens=48
+        )
+        diag = {
+            k: float(v) for k, v in gen.verify_injection_delta(cv_primary, layer, alpha).items()
+        }
+
+        # --- 3. COHERENCE at the pinned dose: OFF vs ON, 2 concepts x 4 trials ---
+        judge = RuleBasedJudge()
+        n_trials_gate = 4
+        off_flags: list[bool] = []
+        on_flags: list[bool] = []
+        for c in concepts:
+            cv_c = cvs[c]
+            alpha_c = 2.0 * float(cv_c.raw_norms[layer])  # per-concept raw_norm dose
+            off = gen.generate_batch(None, layer, 0.0, seed=0, n=n_trials_gate)  # control OFF
+            on = gen.generate_batch(cv_c, layer, alpha_c, seed=0, n=n_trials_gate)  # control ON
+            off_flags += [judge.grade(c, t).coherent for t in off]
+            on_flags += [judge.grade(c, t).coherent for t in on]
+        del gen, cvs, cv_primary
+        _free()
+    except Exception as exc:  # noqa: BLE001 - report the gate failure, run nothing further
+        return {
+            "gate_ok": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "model_type": model_type,
+            "n_layers": n_layers,
+        }
+
+    n_gen = len(off_flags) + len(on_flags)
+    coherence_rate_noinjection = sum(off_flags) / len(off_flags)
+    coherence_rate_injected = sum(on_flags) / len(on_flags)
+    result: dict[str, object] = {
+        "gate_ok": True,
+        "model_type": model_type,
+        "n_layers": n_layers,
+        "layer": layer,
+        "alpha": round(alpha, 3),
+        "magnitude_ratio": round(diag["magnitude_ratio"], 4),
+        "cosine": round(diag["cosine_to_v_unit"], 4),
+        "coherence_rate_noinjection": round(coherence_rate_noinjection, 3),
+        "coherence_rate_injected": round(coherence_rate_injected, 3),
+        "n_gen": n_gen,
+    }
+    print("[gate]", result)
+    return result
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # DeepSeek ungated; NO judge secret on Modal
+    timeout=2 * 3600,
+)
+def run_deepseek_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """GENERATE-ONLY DeepSeek-Coder-33B-Instruct transcripts at the corrected paper
+    dose (raw_norm, k=2) — an EXACT mirror of run_base_k2, so this third-party dense
+    coder sits on the IDENTICAL dose/protocol as the Qwen Coder-32B rung. It moves
+    the n=1 Coder-positive cell to n=2 on a different model family. The authoritative
+    judge is the LOCAL Bedrock judge (AWS SSO is local); the RuleBasedJudge here is a
+    NON-authoritative placeholder so the transcripts persist. Committed result =
+    local Bedrock re-judge of these transcripts.
+
+    Fit-check first: log the ACTUAL alpha (= k·‖raw diff-of-means‖ at the 0.61
+    layer) and one ``verify_injection_delta`` so the dose is observably LIVE (not a
+    no-op / coherence-destroyer) — observe, do NOT tune. $3 cap; separate _k2 path.
+    """
+    import gc
+
+    import torch
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.harness import RepengGenerator, RuleBasedJudge, layer_for_fraction
+    from introspection_scaling.runner import _load_causal_lm
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    # --- FIT CHECK + DOSE OBSERVABILITY (observe, never tune) ---
+    # ONE model resident at a time (33B fp16 ~66 GB; two copies OOM an 80 GB A100):
+    # Phase 1 extract (fp16) -> free -> Phase 2 generator + verify -> free.
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    try:
+        emodel, etok = _load_causal_lm(DEEPSEEK_MODEL_K2, "cuda", "float16", None)
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        cv = extract_concept_vector(
+            DEEPSEEK_MODEL_K2, "oceans", model=emodel, tokenizer=etok, device="cuda"
+        )
+        del emodel, etok
+        _free()
+        if layer not in cv.raw_norms:
+            raise RuntimeError(f"raw_norms missing injection layer {layer}")
+        raw_norm = float(cv.raw_norms[layer])
+        alpha = CODER_K2_STRENGTH_K * raw_norm
+        gen = RepengGenerator(
+            DEEPSEEK_MODEL_K2, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        )
+        diag = {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+        del gen, cv
+        _free()
+    except Exception as exc:  # noqa: BLE001 - report the fit/dose failure, run no sweep
+        return {
+            "fit_ok": False,
+            "model_id": DEEPSEEK_MODEL_K2,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    print(
+        f"[dose] layer={layer} raw_norm={raw_norm:.3f} k={CODER_K2_STRENGTH_K} alpha={alpha:.3f} "
+        f"ratio={diag['magnitude_ratio']:.3f} cos={diag['cosine_to_v_unit']:.3f}"
+    )
+
+    # --- Generate (RuleBasedJudge PLACEHOLDER; transcripts are the payload) ---
+    result = _run(
+        [DEEPSEEK_MODEL_K2],
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=DEEPSEEK_K2_RECORDS,
+        trials_path=DEEPSEEK_K2_TRIALS,
+        depth_fraction=0.61,
+        dose_mode="raw_norm",
+        strength_k=CODER_K2_STRENGTH_K,
+        device="cuda",
+        precision_map=PRECISION_MAP,
+        judge=RuleBasedJudge(),  # NON-authoritative; real verdict = local Bedrock re-judge
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=DEEPSEEK_K2_CAP_USD,
+        rung_gpu_hours=DEEPSEEK_K2_RUNG_HOURS,
+        on_model_done=_results_vol.commit,
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "fit_ok": True,
+        "dose": {
+            "layer": layer,
+            "raw_norm": round(raw_norm, 3),
+            "k": CODER_K2_STRENGTH_K,
+            "alpha": round(alpha, 3),
+            **{k: round(v, 3) for k, v in diag.items()},
+        },
+        "trials_out": DEEPSEEK_K2_TRIALS,
+        "n_trials_persisted": len(result.records),
+        "ran": result.ran,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+        "note": "Modal verdicts are placeholders; authoritative = local Bedrock re-judge",
+    }
+
+
 def _run_rung_k2(
     model_id: str,
     records_path: str,
@@ -1305,6 +1586,27 @@ def moe_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
     concepts = list(CONCEPT_WORDS[:n_concepts])
     result = run_moe_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
     print("moe_k2:", result)
+
+
+@app.local_entrypoint()
+def deepseek_gate(model_id: str = DEEPSEEK_MODEL_K2) -> None:
+    """`modal run modal_app.py::deepseek_gate` — STEP-1 DENSE GATE for DeepSeek-Coder-33B:
+    arch check + dose observability + coherence-under-dose (OFF vs ON). No sweep, no
+    judge; ~$1 GPU bounded by the 900 s timeout. Gate BEFORE paying for deepseek_k2."""
+    result = run_dense_gate.remote(model_id)
+    print("deepseek_gate:", result)
+
+
+@app.local_entrypoint()
+def deepseek_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::deepseek_k2` — generate DeepSeek-Coder-33B-Instruct
+    transcripts (raw_norm k=2, $3 cap). Judge LOCALLY with Bedrock afterwards:
+    scripts/rung_k2_judge.py results/trials_deepseek33b_k2.jsonl."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_deepseek_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("deepseek_k2:", result)
 
 
 @app.local_entrypoint()
