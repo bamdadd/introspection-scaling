@@ -125,20 +125,31 @@ does not transfer across sizes (residual norm scales with architecture). We
 target a fraction of ~0.044 and hard-cap it below 0.09 (a coherence cliff, where
 over-steering degrades and can reverse the effect).
 **Depth = 0.61 fraction-of-depth** (`layer = round(0.61·N)`), the default.
-*Provisional* — the depth and dose defaults come from our companion steering-dose
-study ([steerbench], a separate repo; see Methods), which reports a max-effect
-layer near 0.61 (bracketing the paper's ~0.66) inside a usable band with a
-dead-spot near 0.64. These numbers are **not yet reproduced in this repo** (our
-[RESULTS](RESULTS.md) are tbd); we treat them as preliminary until the artifact
-is linked. Depth stays a parameter; 0.5 and 0.71 are cheap sensitivity points on
-0.5B so the choice isn't depth-cherry-picked.
+Now reproduced in-repo — the depth and dose defaults come from our companion
+steering-dose study ([steerbench], a separate repo; see Methods), and its numbers
+are now locked. steerbench's max-effect layer lands at fraction-of-depth **0.61 on
+Qwen2.5-1.5B-Instruct** (peak L17/28, argmax 0.61, plateau ~0.61–0.93 across 3
+seeds) and **0.607 on Qwen2.5-7B** — two scales converging on 0.61, computed on a
+T4 over 3 seeds and reproducible with one command (`experiments/reproduce.sh`).
+0.61 is a high-effect coherent depth at all three scales tested: argmax on 1.5B
+(frac 0.61) and 7B (frac 0.607), and, on 0.5B, a high-effect coherent region at
+0.62–0.67 sitting on the broad 0.58–0.96 plateau that brackets 0.61 — whose
+*global* argmax is the last layer (frac 0.96, verified to be genuine fluent formal
+prose, not an output-layer artifact).
+steerbench reports this straight rather than forcing every scale to 0.61. The
+usable dose band and coherence cliff reproduce too (α ≈ −0.07…+0.11 usable, cliff
+~0.13–0.17). We still bracket the paper's ~0.66 rather than match it exactly; see
+steerbench's `RESULTS.md` in the [steerbench] repo for the locked artifact. Depth
+stays a parameter; 0.5 and 0.71 are cheap sensitivity points on 0.5B so the choice
+isn't depth-cherry-picked.
 
 **Models: instruct variants** (Qwen2.5-\*-Instruct, Llama-3.x-\*-Instruct). The
 introspection prompt is a multi-turn *chat* self-report; base models don't follow
 instructions, so a base "failure" confounds *can't introspect* with *can't follow
 the prompt* — a fatal confound for a scaling claim. The paper used RLHF chat
 models, so instruct is the faithful analog; our companion steerbench study also
-reports instruct steering more cleanly than base (provisional, same caveat). We
+reports instruct steering more cleanly than base (provisional — base-vs-instruct
+not run in the reproduced sweep). We
 render the prompt with each model's native chat template.
 
 [steerbench]: https://github.com/bamdadd/steerbench
