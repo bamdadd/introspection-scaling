@@ -252,6 +252,32 @@ DEEPSEEK_K2_CAP_USD = 3.0
 DEEPSEEK_K2_RUNG_HOURS = {DEEPSEEK_MODEL_K2: 0.7}
 DEEPSEEK_GATE_CAP_USD = 1.0  # STEP-1 gate; bounded by the 900 s timeout ($1 at $4/hr)
 
+# STEP-1 gate coherence-sampling knobs (shared by every dense gate). MUST match the
+# scored rung's generation length: DeepSeek waved through a short 48-token / 8-sample
+# gate yet collapsed only at the full 200-token trial length, so a short gate is a
+# hole. Sample at the SAME length the rung scores (200) with enough trials to see it:
+# 3 concepts x 8 trials = 24 injected + 24 no-injection per gate.
+GATE_MAX_NEW_TOKENS = 200  # == the scored-trial length; short samples miss late-onset collapse
+GATE_N_CONCEPTS = 3
+GATE_N_TRIALS = 8  # per concept per condition
+
+# First REAL n=2 replication attempt (with the fixed full-length gate above).
+# CodeLlama-34B-Instruct is a dense Llama-arch 34B third-party coder at the IDENTICAL
+# pinned protocol as the Qwen Coder-32B rung (raw_norm k=2, depth 0.61, fp16). 34B
+# fp16 ~68 GB fits one A100-80GB. GATED (Meta license): the Modal HF token must have
+# ACCEPTED the license or the gate/rung 401/403s (the gate reports that as gate_ok
+# False, never a silent crash). Same generate-on-Modal / judge-locally-with-Bedrock
+# split; judge reuses scripts/rung_k2_judge.py. SEPARATE _k2 paths; HARD $3 cap.
+CODELLAMA_MODEL_K2 = "codellama/CodeLlama-34b-Instruct-hf"
+CODELLAMA_K2_RECORDS = f"{_RESULTS_DIR}/records_codellama34b_k2.jsonl"
+CODELLAMA_K2_TRIALS = f"{_RESULTS_DIR}/trials_codellama34b_k2.jsonl"
+CODELLAMA_K2_CAP_USD = 3.0
+# Per-rung est is biased-high yet MUST project under the $3 cap or the guard never
+# starts: 0.7h -> $2.8 < $3 (same A100-80GB envelope as the 32B/33B rungs). This is
+# the value PASSED to run_ladder. The GLOBAL RUNG_GPU_HOURS entry (1.2, harder-biased
+# for 34B) is defensive only — CodeLlama is in no ladder tuple, nothing projects it.
+CODELLAMA_K2_RUNG_HOURS = {CODELLAMA_MODEL_K2: 0.7}
+
 # Per-model precision (SHARED CONTRACT). <=32B -> fp16; 72B anchor -> bf16 + nf4.
 PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     **{m: ("float16", None) for m in QWEN_LADDER + LLAMA_LADDER},
@@ -263,6 +289,8 @@ PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     # DeepSeek-Coder-33B replication: dense 33B fp16, same contract as the 32B rungs
     # (NOT in QWEN_LADDER -> explicit fp16; default float32 would break the contract + OOM).
     DEEPSEEK_MODEL_K2: ("float16", None),
+    # CodeLlama-34B replication: dense 34B fp16, same contract (gated Meta license).
+    CODELLAMA_MODEL_K2: ("float16", None),
     HELD_ANCHOR_72B: ("bfloat16", "nf4"),
 }
 
@@ -306,6 +334,9 @@ RUNG_GPU_HOURS: dict[str, float] = {
     # rungs). Biased-high global est; NOT the value the guard projects against for the
     # rung — run_deepseek_k2 passes the tighter DEEPSEEK_K2_RUNG_HOURS (0.7 -> $2.8 < $3).
     DEEPSEEK_MODEL_K2: 1.0,
+    # CodeLlama-34B replication (dense, ~34B, same envelope). Biased-high global est;
+    # the rung projects against the tighter CODELLAMA_K2_RUNG_HOURS (0.7 -> $2.8 < $3).
+    CODELLAMA_MODEL_K2: 1.2,
 }
 
 # 72B anchor records go to a SEPARATE volume path — write_records opens mode 'w'
@@ -1020,38 +1051,42 @@ def run_moe_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dic
     image=_ladder_image,
     gpu="A100-80GB",
     volumes={_HF_CACHE_DIR: _hf_cache},
-    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # DeepSeek ungated; NO judge secret on Modal
-    # STEP-1 gate: bounds cost to the $1 cap ($4/hr * 0.25h = 900 s). NOTE: weights
-    # MUST be pre-warmed in the HF cache volume — a first-run uncached ~66 GB download
-    # would blow this budget. Run the gate a second time (or warm the cache) if the
-    # first invocation times out on the download rather than the compute.
-    timeout=900,
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # token must have ACCEPTED any gated license
+    # STEP-1 gate: sampling at the full 200-token scored-trial length with 48 gens
+    # (see GATE_* consts) is more compute than the old short gate, so bound it to
+    # 1800 s (~$2 at $4/hr) rather than 900 s. NOTE: weights MUST be pre-warmed in the
+    # HF cache volume — a first-run uncached ~68 GB download would blow this budget.
+    timeout=1800,
 )
 def run_dense_gate(model_id: str = DEEPSEEK_MODEL_K2) -> dict[str, object]:
     """STEP-1 GATE for a DENSE model (the dense analogue of run_moe_fitcheck, which
-    is MoE-only via ``router_shift``). Cheap, standalone, runs BEFORE the full rung.
+    is MoE-only via ``router_shift``). Standalone, runs BEFORE the full rung. Fully
+    parameterised on ``model_id`` so it gates any dense model (DeepSeek, CodeLlama, …).
 
     Three checks, in order of cost:
 
-    1. ARCH CHECK (do NOT assert): log ``model_type`` + ``num_hidden_layers`` and
-       confirm repeng can attach — i.e. the loaded model exposes ``model.model.layers``
-       (the residual stack repeng's ``ControlModel`` wraps). If the hasattr chain is
-       absent (a custom arch), return ``{gate_ok: False, reason: 'repeng cannot
-       attach'}`` and STOP — do not extract, do not generate.
+    1. ARCH CHECK (do NOT assert): load the config (cheap, no weights), log
+       ``model_type`` + ``num_hidden_layers``, then confirm repeng can attach — i.e.
+       the loaded model exposes ``model.model.layers`` (the residual stack repeng's
+       ``ControlModel`` wraps). If the hasattr chain is absent (a custom arch), return
+       ``{gate_ok: False, reason: 'repeng cannot attach'}`` and STOP. A GATED model
+       whose token has NOT accepted the license 401/403s on load — that surfaces as
+       ``gate_ok: False`` with the auth error in ``reason`` (never a silent crash).
     2. DOSE OBSERVABILITY: extract the ``oceans`` concept vector, take the injection
        layer at depth 0.61, pin ``alpha = 2 * raw_norm`` (the corrected raw_norm k=2
        dose), and run one ``verify_injection_delta`` -> ``magnitude_ratio`` (~1.0 means
        repeng injects UNSCALED) + ``cosine``.
-    3. COHERENCE at the pinned dose (the load-bearing gate): generate a small handful
-       of completions on 2 concepts x 4 trials, BOTH control-OFF (no injection) and
-       control-ON (injected at the per-concept alpha), score each with the
-       ``RuleBasedJudge`` coherence heuristic, and report
+    3. COHERENCE at the pinned dose (the load-bearing gate): generate completions at
+       the FULL scored-trial length (``GATE_MAX_NEW_TOKENS`` = 200) on
+       ``GATE_N_CONCEPTS`` concepts x ``GATE_N_TRIALS`` trials, BOTH control-OFF (no
+       injection) and control-ON (injected at the per-concept alpha), score each with
+       the ``RuleBasedJudge`` coherence heuristic, and report
        ``coherence_rate_noinjection`` vs ``coherence_rate_injected``. A large drop ON
-       vs OFF is the Coder-7B failure mode (coherence collapse under dose) — catching
-       it here avoids paying for a full rung whose transcripts are all incoherent.
+       vs OFF is the coherence-collapse-under-dose failure mode. Sampling at the full
+       length is what closes the hole that waved DeepSeek through a short-token gate.
 
-    Two-phase load (extract -> free -> generator) so only one 33B copy is resident.
-    $1 cap (via the 900 s timeout). Prints every field. Runs no sweep, writes nothing.
+    Two-phase load (extract -> free -> generator) so only one ~34B copy is resident.
+    Bounded to ~$2 (1800 s timeout). Prints every field. Runs no sweep, writes nothing.
     """
     import gc
 
@@ -1072,16 +1107,21 @@ def run_dense_gate(model_id: str = DEEPSEEK_MODEL_K2) -> dict[str, object]:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # --- 1. ARCH CHECK (cheap config, no weights) ---
-    cfg = AutoConfig.from_pretrained(DEEPSEEK_MODEL_K2)
-    model_type = str(getattr(cfg, "model_type", "unknown"))
-    n_layers = int(cfg.num_hidden_layers)
-    print(f"[gate] model_type={model_type} n_layers={n_layers}")
-
-    # --- 2. DOSE OBSERVABILITY: extract (Phase 1) then verify + cohere (Phase 2) ---
-    concepts = ["oceans", CONCEPT_WORDS[0].lower()]  # oceans (primary, for the delta) + one more
+    # oceans (primary, for the delta) + the first GATE_N_CONCEPTS-1 CONCEPT_WORDS.
+    concepts = ["oceans"] + [w.lower() for w in CONCEPT_WORDS[: GATE_N_CONCEPTS - 1]]
+    model_type = "unknown"
+    n_layers = -1
+    # Everything that touches the (possibly GATED) weights is inside the try: a 401/403
+    # on config OR load returns gate_ok False with the auth reason, never crashes.
     try:
-        emodel, etok = _load_causal_lm(DEEPSEEK_MODEL_K2, "cuda", "float16", None)
+        # --- 1. ARCH CHECK (cheap config, no weights) ---
+        cfg = AutoConfig.from_pretrained(model_id)
+        model_type = str(getattr(cfg, "model_type", "unknown"))
+        n_layers = int(cfg.num_hidden_layers)
+        print(f"[gate] model={model_id} model_type={model_type} n_layers={n_layers}")
+
+        # --- 2. DOSE OBSERVABILITY: extract (Phase 1) then verify + cohere (Phase 2) ---
+        emodel, etok = _load_causal_lm(model_id, "cuda", "float16", None)
         # repeng attach check on the LIVE model (the hasattr chain ControlModel wraps).
         if not (hasattr(emodel, "model") and hasattr(emodel.model, "layers")):
             del emodel, etok
@@ -1096,9 +1136,7 @@ def run_dense_gate(model_id: str = DEEPSEEK_MODEL_K2) -> dict[str, object]:
         layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
         # Extract a vector per coherence concept (raw_norm dose is per-concept).
         cvs = {
-            c: extract_concept_vector(
-                DEEPSEEK_MODEL_K2, c, model=emodel, tokenizer=etok, device="cuda"
-            )
+            c: extract_concept_vector(model_id, c, model=emodel, tokenizer=etok, device="cuda")
             for c in concepts
         }
         del emodel, etok
@@ -1110,30 +1148,29 @@ def run_dense_gate(model_id: str = DEEPSEEK_MODEL_K2) -> dict[str, object]:
         raw_norm = float(cv_primary.raw_norms[layer])
         alpha = 2.0 * raw_norm  # raw_norm k=2 dose (same corrected dose as the _k2 rungs)
 
-        # Phase 2: generator for verify + coherence. 48 tokens is enough for the
-        # coherence heuristic (>=2 words + repetition check) to see early collapse.
+        # Phase 2: generator for verify + coherence. Sample coherence at the FULL
+        # scored-trial length so late-onset collapse (DeepSeek at 200 tokens) is caught.
         gen = RepengGenerator(
-            DEEPSEEK_MODEL_K2, device="cuda", dtype="float16", quant=None, max_new_tokens=48
+            model_id, device="cuda", dtype="float16", quant=None, max_new_tokens=GATE_MAX_NEW_TOKENS
         )
         diag = {
             k: float(v) for k, v in gen.verify_injection_delta(cv_primary, layer, alpha).items()
         }
 
-        # --- 3. COHERENCE at the pinned dose: OFF vs ON, 2 concepts x 4 trials ---
+        # --- 3. COHERENCE at the pinned dose: OFF vs ON, GATE_N_CONCEPTS x GATE_N_TRIALS ---
         judge = RuleBasedJudge()
-        n_trials_gate = 4
         off_flags: list[bool] = []
         on_flags: list[bool] = []
         for c in concepts:
             cv_c = cvs[c]
             alpha_c = 2.0 * float(cv_c.raw_norms[layer])  # per-concept raw_norm dose
-            off = gen.generate_batch(None, layer, 0.0, seed=0, n=n_trials_gate)  # control OFF
-            on = gen.generate_batch(cv_c, layer, alpha_c, seed=0, n=n_trials_gate)  # control ON
+            off = gen.generate_batch(None, layer, 0.0, seed=0, n=GATE_N_TRIALS)  # control OFF
+            on = gen.generate_batch(cv_c, layer, alpha_c, seed=0, n=GATE_N_TRIALS)  # control ON
             off_flags += [judge.grade(c, t).coherent for t in off]
             on_flags += [judge.grade(c, t).coherent for t in on]
         del gen, cvs, cv_primary
         _free()
-    except Exception as exc:  # noqa: BLE001 - report the gate failure, run nothing further
+    except Exception as exc:  # noqa: BLE001 - report the gate failure (incl. gated 401/403)
         return {
             "gate_ok": False,
             "reason": f"{type(exc).__name__}: {exc}",
@@ -1261,6 +1298,121 @@ def run_deepseek_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -
             **{k: round(v, 3) for k, v in diag.items()},
         },
         "trials_out": DEEPSEEK_K2_TRIALS,
+        "n_trials_persisted": len(result.records),
+        "ran": result.ran,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+        "note": "Modal verdicts are placeholders; authoritative = local Bedrock re-judge",
+    }
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # token must have ACCEPTED the Meta license
+    timeout=2 * 3600,
+)
+def run_codellama_k2(
+    concepts: list[str], seeds: list[int], n_trials: int = 12
+) -> dict[str, object]:
+    """GENERATE-ONLY CodeLlama-34B-Instruct transcripts at the corrected paper dose
+    (raw_norm, k=2) — an EXACT mirror of run_deepseek_k2 / run_base_k2, so this
+    third-party dense coder sits on the IDENTICAL dose/protocol as the Qwen Coder-32B
+    rung. It is the first REAL n=2 replication attempt (gated BY run_dense_gate at
+    full 200-token length first). The authoritative judge is the LOCAL Bedrock judge
+    (AWS SSO is local); the RuleBasedJudge here is a NON-authoritative placeholder so
+    the transcripts persist. Committed result = local Bedrock re-judge.
+
+    CodeLlama is GATED (Meta license): a token that has not accepted it 401/403s on
+    load — reported as ``fit_ok: False`` with the auth error (run no sweep), never a
+    silent crash.
+
+    Fit-check first: log the ACTUAL alpha (= k·‖raw diff-of-means‖ at the 0.61
+    layer) and one ``verify_injection_delta`` so the dose is observably LIVE (not a
+    no-op / coherence-destroyer) — observe, do NOT tune. $3 cap; separate _k2 path.
+    """
+    import gc
+
+    import torch
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.harness import RepengGenerator, RuleBasedJudge, layer_for_fraction
+    from introspection_scaling.runner import _load_causal_lm
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    # --- FIT CHECK + DOSE OBSERVABILITY (observe, never tune) ---
+    # ONE model resident at a time (34B fp16 ~68 GB; two copies OOM an 80 GB A100):
+    # Phase 1 extract (fp16) -> free -> Phase 2 generator + verify -> free.
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    try:
+        emodel, etok = _load_causal_lm(CODELLAMA_MODEL_K2, "cuda", "float16", None)
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        cv = extract_concept_vector(
+            CODELLAMA_MODEL_K2, "oceans", model=emodel, tokenizer=etok, device="cuda"
+        )
+        del emodel, etok
+        _free()
+        if layer not in cv.raw_norms:
+            raise RuntimeError(f"raw_norms missing injection layer {layer}")
+        raw_norm = float(cv.raw_norms[layer])
+        alpha = CODER_K2_STRENGTH_K * raw_norm
+        gen = RepengGenerator(
+            CODELLAMA_MODEL_K2, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        )
+        diag = {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+        del gen, cv
+        _free()
+    except Exception as exc:  # noqa: BLE001 - report the fit/dose failure (incl. gated 401/403)
+        return {
+            "fit_ok": False,
+            "model_id": CODELLAMA_MODEL_K2,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    print(
+        f"[dose] layer={layer} raw_norm={raw_norm:.3f} k={CODER_K2_STRENGTH_K} alpha={alpha:.3f} "
+        f"ratio={diag['magnitude_ratio']:.3f} cos={diag['cosine_to_v_unit']:.3f}"
+    )
+
+    # --- Generate (RuleBasedJudge PLACEHOLDER; transcripts are the payload) ---
+    result = _run(
+        [CODELLAMA_MODEL_K2],
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=CODELLAMA_K2_RECORDS,
+        trials_path=CODELLAMA_K2_TRIALS,
+        depth_fraction=0.61,
+        dose_mode="raw_norm",
+        strength_k=CODER_K2_STRENGTH_K,
+        device="cuda",
+        precision_map=PRECISION_MAP,
+        judge=RuleBasedJudge(),  # NON-authoritative; real verdict = local Bedrock re-judge
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=CODELLAMA_K2_CAP_USD,
+        rung_gpu_hours=CODELLAMA_K2_RUNG_HOURS,
+        on_model_done=_results_vol.commit,
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "fit_ok": True,
+        "dose": {
+            "layer": layer,
+            "raw_norm": round(raw_norm, 3),
+            "k": CODER_K2_STRENGTH_K,
+            "alpha": round(alpha, 3),
+            **{k: round(v, 3) for k, v in diag.items()},
+        },
+        "trials_out": CODELLAMA_K2_TRIALS,
         "n_trials_persisted": len(result.records),
         "ran": result.ran,
         "stopped_reason": result.stopped_reason,
@@ -1591,8 +1743,9 @@ def moe_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
 @app.local_entrypoint()
 def deepseek_gate(model_id: str = DEEPSEEK_MODEL_K2) -> None:
     """`modal run modal_app.py::deepseek_gate` — STEP-1 DENSE GATE for DeepSeek-Coder-33B:
-    arch check + dose observability + coherence-under-dose (OFF vs ON). No sweep, no
-    judge; ~$1 GPU bounded by the 900 s timeout. Gate BEFORE paying for deepseek_k2."""
+    arch check + dose observability + full-length coherence-under-dose (OFF vs ON). No
+    sweep, no judge; ~$2 GPU bounded by the 1800 s timeout. Gate BEFORE paying for the
+    rung. (The fixed gate samples at 200 tokens, which now catches the DeepSeek collapse.)"""
     result = run_dense_gate.remote(model_id)
     print("deepseek_gate:", result)
 
@@ -1607,6 +1760,29 @@ def deepseek_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
     concepts = list(CONCEPT_WORDS[:n_concepts])
     result = run_deepseek_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
     print("deepseek_k2:", result)
+
+
+@app.local_entrypoint()
+def codellama_gate(model_id: str = CODELLAMA_MODEL_K2) -> None:
+    """`modal run modal_app.py::codellama_gate` — STEP-1 DENSE GATE for CodeLlama-34B:
+    arch check + dose observability + full-length (200-token) coherence-under-dose
+    (OFF vs ON). No sweep, no judge; ~$2 GPU bounded by the 1800 s timeout. Gate BEFORE
+    paying for codellama_k2. GATED: a token without the accepted Meta license returns
+    gate_ok False with the auth reason (never a silent crash)."""
+    result = run_dense_gate.remote(model_id)
+    print("codellama_gate:", result)
+
+
+@app.local_entrypoint()
+def codellama_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::codellama_k2` — generate CodeLlama-34B-Instruct
+    transcripts (raw_norm k=2, $3 cap). Judge LOCALLY with Bedrock afterwards:
+    scripts/rung_k2_judge.py results/trials_codellama34b_k2.jsonl."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_codellama_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("codellama_k2:", result)
 
 
 @app.local_entrypoint()
