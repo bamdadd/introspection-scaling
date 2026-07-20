@@ -18,3 +18,9 @@ artifacts/*.pt
 results/*.raw.json
 results/records.jsonl
 .DS_Store
+
+# LaTeX build artifacts
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
