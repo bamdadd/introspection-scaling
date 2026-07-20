@@ -22,6 +22,8 @@ cell does not replicate down the Coder size ladder.](results/scaling_trend_k2.pn
 
 **Write-up:** [Same size, different mind](https://bamdad.substack.com/p/same-size-different-mind) walks through the reproduction, the dosing bug that faked a null, and the fine-tune dissociation. The formal note (abstract, methods, results, limitations) is in [docs/note.md](docs/note.md).
 
+**Cross-architecture check.** The residual-injection hook transfers to a Mixture-of-Experts model (Qwen1.5-MoE) and perturbs expert routing — the top-k expert set flips at 79% of positions — yet detection stays null: a mechanism-vs-behaviour dissociation, not an architecture verdict ([docs/note.md §5](docs/note.md#5-generalization-a-cross-architecture-moe-probe)).
+
 **Original (superseded) result:** across Qwen2.5-Instruct 0.5→32B, injected-concept
 detection was **0/216 at every rung — and so were both controls.** Read as
 under-dosed (see the correction above), not a capability bound. 72B and Llama-3.x

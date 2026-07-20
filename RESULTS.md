@@ -125,6 +125,32 @@ Coherence climbs with scale (0.5B is largely incoherent under the paper-strength
 the Instruct model is both coherent and frequently affirmative, yet still never
 correctly identifies the concept. Correct-identification is the wall.
 
+### Cross-model dose-fragility: an out-of-family broken-model null (DeepSeek-Coder-33B)
+
+Dose-fragility is not only about absolute strength — it is also model-specific. We ran
+one out-of-family rung, **DeepSeek-Coder-33B-Instruct**, at the same norm-relative k = 2
+dose used across the Qwen ladder (`α = 2·‖raw diff-of-means‖ = 899`, magnitude-ratio
+**1.02** — correctly proportioned to this model's own residual norm, not over-dosed). At
+full generation length coherence **collapsed**: injected coherent **0.042**,
+random-direction **0.093**, against **1.000** with no injection; the transcripts are
+word-salad and correct-id is **0/216 strict**. The tell is that the **random-direction
+control collapsed too** (0.093). If the injected concept were the culprit we would see the
+injected condition fall while the matched-norm control held; both falling together means
+the **dose magnitude**, not the concept, broke the model. So this 0/216 is a
+**broken-model null** — an invalid test, not evidence about introspection — the same
+failure mode as Coder-7B (0.972 → 0.056 under injection), now reproduced across model
+families. The identical dose keeps Qwen2.5-Coder-32B (coherent 0.773), the Qwen1.5-MoE
+probe (0.750), and the dense Qwen rungs coherent, so coherence tolerance to a matched,
+correctly-proportioned dose is model-specific. It does **not** move the headline —
+Coder-32B stays the single above-chance cell and this rung enters nothing into it — and it
+is logged for transparency (records and judged transcripts in commit `33ba9d2`).
+
+**Methods lesson — gate coherence at full generation length.** A short pre-run coherence
+gate (48 tokens, 8 samples) passed on this model; the 200-token scoring run then
+collapsed. Coherence degrades with generated length under a fixed dose, so a coherence
+sanity-check must sample at the **same length the real trials generate**, or it will wave
+through a model that is about to fall apart.
+
 ## Why the Coder and not the Instruct (at 32B)
 
 This section is about the **one positive cell** — Coder-32B vs base/Instruct at 32B. It
@@ -219,6 +245,11 @@ post-training.](results/logit_lens_k2.png)
   incoherent text cannot register a strict success, so that cell is partly a
   broken-model null rather than a capable-but-silent one. The dose (k = 2) was pinned
   a-priori across the whole ladder; we do not re-dose per rung.
+- **Coherence tolerance is model-specific.** One out-of-family rung
+  (DeepSeek-Coder-33B-Instruct) collapsed to word-salad at the same correctly-proportioned
+  norm-relative dose (both injected and random-direction), yielding a broken-model null —
+  an invalid test, not a data point against the effect. See
+  [cross-model dose-fragility](#cross-model-dose-fragility-an-out-of-family-broken-model-null-deepseek-coder-33b).
 - **No inferential trend test.** With three sizes per family and counts this small, a
   trend/Cochran-Armitage/p-value test would be underpowered and invite p-hacking. We
   report raw counts and the per-cell above-chance test only.
