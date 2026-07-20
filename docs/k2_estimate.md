@@ -1,5 +1,12 @@
 # STEP 3 — Kimi-K2 cost & feasibility estimate
 
+> **Decision (2026-07-20): K2 is DEFERRED, not rejected.** No K2 run is authorized —
+> not even the STEP-1 gate. The small-MoE probe already delivered the methods win (the
+> injection perturbs MoE expert routing, 79%) plus an honest null, and K2-*base* is not
+> code-post-trained, so it would not test the code-post-training × scale conjunction
+> cleanly. The ~$150–400 marginal spend is not worth it now. Revisit if a cheaper
+> hook-attachment path to K2 (or a large-active *code*-post-trained MoE) appears.
+
 > **Naming, first, to kill a grep collision.** This document is about **Kimi-K2**,
 > Moonshot's ~1T-parameter mixture-of-experts model. It has **nothing to do with**
 > the `_k2` suffix all over this repo (`trials_*_k2_bedrock.jsonl`,
