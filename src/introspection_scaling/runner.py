@@ -266,7 +266,9 @@ def run_ladder(
     """
 
     def _default_gen(model_id: str, dtype: str, quant: str | None) -> DoseGeneratorLike:
-        return _default_generator(model_id, dtype, quant, device=device, max_new_tokens=max_new_tokens)
+        return _default_generator(
+            model_id, dtype, quant, device=device, max_new_tokens=max_new_tokens
+        )
 
     gen_factory: GeneratorFactory = make_generator if make_generator is not None else _default_gen
     resolved_judge = _resolve_judge(judge, allow_rule_based=allow_rule_based_judge)
