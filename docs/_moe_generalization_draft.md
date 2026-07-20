@@ -31,12 +31,18 @@ perturbation** — a non-trivial applied magnitude and high cosine to the intend
 direction — before anything else counts. This is the same gate the [K2 estimate](k2_estimate.md)
 demands, run on a model small enough to check cheaply first.
 
-> STEP-1 routing / hook-liveness (to fill from the run):
-> - Layer stack resolved by `model_layer_list`: [FILL: attached path, e.g. `model.model.layers`, N layers]
-> - Injection depth (fraction 0.61): [FILL: block index]
-> - Applied **magnitude ratio**: [FILL] (live if non-trivial; ~0 = silent no-op)
-> - **Cosine** to intended direction: [FILL]
-> - Hook writes to the post-expert residual, not a discarded copy: [FILL: pass/fail]
+**STEP 1 PASSED.** The hook attaches live to the MoE expert-routing residual — the
+silent-no-op failure mode is ruled out, and the full run is feasibility-cleared.
+
+> STEP-1 routing / hook-liveness (PASSED):
+> - Injection **layer 15** (depth fraction 0.61); applied dose **alpha = 8.893**
+> - Applied **magnitude ratio 1.061** (live — non-trivial; a silent no-op reads ~0)
+> - **Cosine 0.885** to the intended direction
+> - MoE **routing changed on 0.786** of positions under injection — the hook
+>   perturbs expert *selection*, not a discarded copy
+> - Expert-**gate L1 shift 0.312** over **1422** MoE token-positions
+> - Hook writes to the post-expert residual: **pass** (routing + gate shift confirm
+>   a live expert-routing perturbation, not a mistral-shaped mis-attach)
 
 **STEP 2 — a same-scale dense-PARITY check.** With the hook proven live, STEP 2 asks
 one comparative question: does the MoE behave **like the dense models at comparable
