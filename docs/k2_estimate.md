@@ -121,7 +121,15 @@ no-op or a coherence-destroyer"*). Run **STEP 1 only** on K2:
 2. Read back the applied **magnitude ratio** and **cosine** against the intended
    direction. A live injection shows a non-trivial magnitude ratio and high cosine;
    a silent no-op shows **~0 magnitude change** — caught here, before spend.
-3. Confirm the perturbation actually moves the residual (e.g. affirmative-rate lift
+3. **Recommended primary gate for an MoE: the router-shift metric**
+   (`RepengGenerator.router_shift`). Magnitude ratio and cosine can look healthy even
+   when the write lands on a routing artefact; `router_shift` measures whether the
+   **top-k expert set actually changes** under injection, so it catches a silent no-op
+   *on routing specifically* — the exact failure mode a custom MoE modeling file
+   introduces. On the Qwen1.5-MoE probe this read **0.786** (the expert set flipped at
+   79% of positions), the unambiguous "hook is live on the experts" signal; require a
+   comparably non-trivial `router_shift` on K2 before authorizing spend.
+4. Confirm the perturbation actually moves the residual (e.g. affirmative-rate lift
    under injection vs control on a handful of trials), so we know the hook writes to
    the real forward path and not a dead copy.
 
@@ -138,4 +146,4 @@ is the real deliverable of this estimate.
 | **Memory** | ~1.0 TB weights (fp8) / ~2.0 TB (bf16); multi-GPU, near-certainly **multi-node** (2× 8×H200); ~13–25× a single A100. **Not** a single-A100 rung. |
 | **Wall-clock** | **~1–4 hr** end-to-end per run, dominated by ~1 TB weight load + node provisioning, not the ~minutes of actual decode (anchored to the measured Coder-32B ≈ 1 H100-hr rung × 2–5× multi-node tax). |
 | **Dollars** | **~$50–700 GPU** per run (most-likely ~$150–400) + ~$2–5 Bedrock; an order of magnitude over the entire ~$23 dense study. |
-| **Gate** | **A K2-specific STEP-1 hook-attachment fit-check MUST pass first.** `repeng` assumes `model.model.layers`; K2 is custom `trust_remote_code` MoE and can **silently no-op**. No live magnitude-ratio/cosine, no authorized run. |
+| **Gate** | **A K2-specific STEP-1 hook-attachment check MUST pass first.** `repeng` assumes `model.model.layers`; K2 is custom `trust_remote_code` MoE and can **silently no-op**. Primary gate is the **`RepengGenerator.router_shift`** metric (top-k expert-set change) — sharper than magnitude alone, which can look healthy on a routing artefact; the Qwen1.5-MoE probe read 0.786. No non-trivial router-shift, no authorized run. |

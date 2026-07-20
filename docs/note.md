@@ -54,11 +54,38 @@ Only the 32B Coder cell is above chance. The same code fine-tune is null at 7B (
 
 Our first pass reported a clean null on every model, including Coder-32B where the effect is claimed. It was wrong for two compounding reasons. The injection dose was inherited from a companion steering study and tuned for coherent output, which put it roughly 4 to 18 times below the paper's absolute strength; the effect-size measurement, not the detection score, is what exposed this. Separately, a same-day judge-API credit outage silently turned grades into false negatives. Correcting the dose to the paper's regime and moving to a fails-loud judge is what surfaced the real signal. We keep the superseded numbers in the repository, marked, because the wrong turn is half the story: a steering-calibrated dose plus a quiet judge will hand you a null you will believe.
 
-## 5. Limitations
+## 5. Generalization: a cross-architecture (MoE) probe
 
-The Coder-32B effect is 2.3%, modest, rests on a single a-priori dose with no sweep, and is the only above-chance cell in the whole 3-variant by 3-size grid — it does not replicate at 7B or 14B of the same Coder fine-tune, so read it as at most necessary-but-not-sufficient evidence for code post-training. The non-replication is itself imperfect: Coder-7B's null is confounded by an injection-induced coherence collapse. We identify the 32B cell's mechanism as legibility but not its cause: we do not yet know which layers or features code post-training changes, or whether the driver is code specifically or a correlate of it. A 72B triple and a cross-architecture check (a mixture-of-experts model) are the obvious next tests. Everything is fp16 on a single A100, dense Qwen only.
+**State the confound before the result.** The cross-architecture probe runs the same concept-injection protocol on a **mixture-of-experts** model, **Qwen1.5-MoE-A2.7B-Chat** (**2.7B active / 14.3B total, 24 layers**), a general-instruct MoE. That model sits **far below the ~32B-active scale** where the one above-chance cell appeared, **and** it carries **no code-specific post-training**. On both axes that made the Coder-32B cell light up (code-heavy post-training AND ~32B scale), this MoE is on the *null* side — it is the architectural analog of our dense general-instruct arm, which is null at every size we tested. So a null here is **predetermined by scale and post-training, not by architecture**; it is not a verdict that "MoE models cannot introspect." The probe is not run to see whether an MoE "passes." It has two narrower, honest jobs.
 
-## 6. Reproducibility
+**STEP 1 — is the injection hook live on MoE expert routing?** The injection is a `repeng.ControlModel` forward hook, and `repeng` assumes a mistral/Qwen-shaped `model.model.layers` stack. An MoE decoder layer routes through experts and its `forward` can return a `(hidden, router_logits)` tuple, so the hook can attach to the wrong tensor and **silently no-op** — scoring a clean but meaningless null. STEP 1 requires a live perturbation before anything else counts, and it passed: the stack resolved via `model.model.layers`, and the injected direction is live, correctly oriented, and **demonstrably changes expert routing**.
+
+| STEP-1 gate (Qwen1.5-MoE-A2.7B-Chat) | value |
+|--------------------------------------|:-----:|
+| injection layer (depth 0.61 of 24)   | 15 |
+| dose `alpha` = 2 × `raw_norm` (4.447) | 8.893 |
+| magnitude ratio (live if ≫0)          | 1.061 |
+| cosine to intended direction          | 0.885 |
+| **routing changed** (top-k expert set flips) | **0.786** of MoE positions |
+| expert-gate L1 shift / MoE positions  | 0.312 / 1422 |
+
+The `routing_changed` = 0.786 is the load-bearing number: the top-k expert *set* flips at 79% of positions under injection, so the hook perturbs expert *selection* and writes to the real post-expert residual, not a discarded copy. The silent-no-op failure mode is ruled out.
+
+**STEP 2 — a same-scale dense-parity check.** With the hook proven live, STEP 2 asks whether the MoE sits on the dense null curve at its own active scale. It does.
+
+| Model (MoE, 2.7B active / 14.3B total) | correct-id (x/216) [95% CI] | affirmative | coherent | above chance? |
+|----------------------------------------|:---------------------------:|:-----------:|:--------:|:-------------:|
+| Qwen1.5-MoE-A2.7B-Chat | 0.000 (0/216) [0.000, 0.000] | 0.005 (1/216) | 0.750 | **no** |
+
+Both controls (no-injection, random-direction) are 0.000 on correct-id. Coherence by condition: no-injection 0.931, injected 0.750, random-direction 0.648. Read this carefully, and do not over-read it in either direction. **The headline is a mechanism/behaviour dissociation:** the injection is mechanistically live (79% of positions re-route, magnitude ratio ~1.06) and yet produces **zero introspective detection** (0/216, not above chance) — the same null as the dense sub-32B rungs, so a small general-instruct MoE sits **on** the dense null curve, not off it. **The near-floor affirmative (0.005) is a scale fact, not an architecture break:** the strong "affirms an injected thought ~45%" signature was scale-dependent in the dense models too — 32B affirms ~45%, but 14B-Instruct affirms only 0.023 (5/216) — so a floor affirmative at 2.7B active is what small *dense* models do, attributable to scale, not to MoE architecture. We report the number and do not claim a dissociation the data cannot isolate. **And it is a genuine null, not a broken-model null:** coherence holds at 0.750 under injection (vs 0.931 without), so the model is largely capable-but-silent, unlike Coder-7B whose 0/216 was confounded by a coherence collapse to 0.056.
+
+The publishable positive is STEP 1 as a methods result: the residual-injection hook transfers cleanly to an expert-routed architecture and demonstrably perturbs routing (79% expert-set change), so the technique is not dense-only. The behavioural effect stays absent exactly as predetermined — detection needed the conjunction of code-heavy post-training AND ~32B scale, and this model has neither, so its null is **not an architecture verdict**. Whether a large-active, code-post-trained MoE (Kimi-K2 scale) would introspect is left open and estimated separately (see the [K2 cost/feasibility estimate](k2_estimate.md), gated on its own STEP-1 router-shift check).
+
+## 6. Limitations
+
+The Coder-32B effect is 2.3%, modest, rests on a single a-priori dose with no sweep, and is the only above-chance cell in the whole 3-variant by 3-size grid — it does not replicate at 7B or 14B of the same Coder fine-tune, so read it as at most necessary-but-not-sufficient evidence for code post-training. The non-replication is itself imperfect: Coder-7B's null is confounded by an injection-induced coherence collapse. We identify the 32B cell's mechanism as legibility but not its cause: we do not yet know which layers or features code post-training changes, or whether the driver is code specifically or a correlate of it. The cross-architecture MoE probe (§5) is now done — the null it returns is predetermined by scale and post-training, not an architecture verdict; a 72B dense triple and a large-active code-post-trained MoE (K2-scale) remain the obvious next tests. Everything is fp16 on a single A100, dense Qwen only apart from that one MoE probe.
+
+## 7. Reproducibility
 
 Deterministic, fixed seeds (0/1/2), one Modal A100-80GB, fp16, corrected dose `alpha = 2 * ||raw diff-of-means||`, Bedrock Sonnet 4 judge that fails loud. Total spend about 20 USD in GPU and judge calls (the base rung was 0.78 USD of GPU). Code, raw transcripts, and the exact dose calibration are in the repository; a companion write-up is at https://bamdad.substack.com/p/same-size-different-mind.
 
