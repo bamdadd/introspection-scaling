@@ -298,3 +298,75 @@ def test_cli_uses_builtin_baseline_words_by_default(monkeypatch, tmp_path: Path)
     runner_mod.main(["--models", "Qwen/Qwen2.5-0.5B-Instruct", "--out", str(tmp_path / "out")])
 
     assert captured["baseline_words"] == BASELINE_WORDS
+
+
+def test_max_new_tokens_forwarded_to_generator(monkeypatch, tmp_path: Path) -> None:
+    """max_new_tokens kwarg on run_ladder reaches the default generator factory."""
+    received: dict = {}
+
+    def fake_default_generator(model_id, dtype, quant, *, device, max_new_tokens):
+        received["max_new_tokens"] = max_new_tokens
+        return f"generator:{model_id}"
+
+    monkeypatch.setattr(runner_mod, "_default_generator", fake_default_generator)
+
+    rec = _Recorder()
+    result = run_ladder(
+        _MODELS[:1],
+        concepts=["Oceans"],
+        seeds=[0],
+        n_trials=1,
+        out_path=tmp_path / "records.jsonl",
+        max_new_tokens=42,
+        judge=object(),
+        extract_fn=rec.extract,
+        # NO make_generator supplied -> uses default generator path
+        generate_completions_fn=rec.gen_completions,
+        judge_completions_fn=rec.judge,
+        write_seed_records_fn=rec.write,
+        load_model_fn=rec.load_model,
+    )
+    assert result.ran == _MODELS[:1]
+    assert received["max_new_tokens"] == 42
+
+
+def test_cli_max_new_tokens_forwarded_to_run_ladder(monkeypatch, tmp_path: Path) -> None:
+    """--max-new-tokens on the CLI is forwarded as max_new_tokens to run_ladder."""
+    captured: dict = {}
+
+    def fake_run_ladder(models, **kwargs):
+        captured.update(kwargs)
+        return LadderRun(records=[SeedRecord("m", "Oceans", "injected", 0, 1, 1)], ran=list(models))
+
+    monkeypatch.setattr(runner_mod, "run_ladder", fake_run_ladder)
+    runner_mod.main(
+        [
+            "--models",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "--out",
+            str(tmp_path / "records.jsonl"),
+            "--max-new-tokens",
+            "42",
+        ]
+    )
+    assert captured["max_new_tokens"] == 42
+
+
+def test_cli_max_new_tokens_default_is_200(monkeypatch, tmp_path: Path) -> None:
+    """--max-new-tokens defaults to 200, preserving prior behaviour."""
+    captured: dict = {}
+
+    def fake_run_ladder(models, **kwargs):
+        captured.update(kwargs)
+        return LadderRun(records=[], ran=list(models))
+
+    monkeypatch.setattr(runner_mod, "run_ladder", fake_run_ladder)
+    runner_mod.main(
+        [
+            "--models",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "--out",
+            str(tmp_path / "records.jsonl"),
+        ]
+    )
+    assert captured["max_new_tokens"] == 200
