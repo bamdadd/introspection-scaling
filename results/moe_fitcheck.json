@@ -1,0 +1,21 @@
+{
+  "fit_ok": true,
+  "model_id": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+  "layer": 15,
+  "raw_norm": 4.447,
+  "k": 2.0,
+  "alpha": 8.893,
+  "verify_injection_delta": {
+    "first_changed_index": 17.0,
+    "delta_norm": 9.4399,
+    "expected_norm": 8.8935,
+    "magnitude_ratio": 1.0614,
+    "cosine_to_v_unit": 0.8852
+  },
+  "router_shift": {
+    "routing_changed_frac": 0.7855,
+    "gate_l1_shift": 0.3123,
+    "n_moe_positions": 1422.0
+  },
+  "note": "nonzero router_shift => injection perturbs expert routing (live on the experts)"
+}

@@ -69,7 +69,7 @@ Our first pass reported a clean null on every model, including Coder-32B where t
 | **routing changed** (top-k expert set flips) | **0.786** of MoE positions |
 | expert-gate L1 shift / MoE positions  | 0.312 / 1422 |
 
-The `routing_changed` = 0.786 is the load-bearing number: the top-k expert *set* flips at 79% of positions under injection, so the hook perturbs expert *selection* and writes to the real post-expert residual, not a discarded copy. The silent-no-op failure mode is ruled out.
+The `routing_changed` = 0.786 is the load-bearing number: the top-k expert *set* flips at 79% of positions under injection, so the hook perturbs expert *selection* and writes to the real post-expert residual, not a discarded copy. The silent-no-op failure mode is ruled out. These STEP-1 numbers are the committed fit-check artifact [`results/moe_fitcheck.json`](../results/moe_fitcheck.json); regenerate with `modal run modal_app.py::moe_fitcheck`.
 
 **STEP 2 — a same-scale dense-parity check.** With the hook proven live, STEP 2 asks whether the MoE sits on the dense null curve at its own active scale. It does.
 
