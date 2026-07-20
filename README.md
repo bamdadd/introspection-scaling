@@ -161,7 +161,12 @@ render the prompt with each model's native chat template.
 published hardware + wall-clock · negative results reported plainly.
 
 ## Status
-Scaffold. See [RESULTS.md](RESULTS.md) and open issues.
+Reproduced and written up. The Qwen2.5 size-trend result (base / general-instruct /
+code-instruct, 7B to 32B) is in [RESULTS.md](RESULTS.md), with the write-up
+[Same size, different mind](https://bamdad.substack.com/p/same-size-different-mind)
+and the formal note in [docs/note.md](docs/note.md). Larger rosters and
+cross-architecture probes are tracked in the
+[open issues](https://github.com/bamdadd/introspection-scaling/issues).
 
 ## Contributing
 Contributions welcome — start with the
