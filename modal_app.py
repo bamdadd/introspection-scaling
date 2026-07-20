@@ -217,6 +217,20 @@ RUNG_K2_TRIALS = {
     RUNG_K2_CODER_14B: f"{_RESULTS_DIR}/trials_coder14b_k2.jsonl",
 }
 
+# Cross-architecture MoE probe (issue #39). Qwen1.5-MoE-A2.7B-Chat: a sparse MoE
+# (60 experts, top-4, ~2.7B active / ~14B total) at the SAME corrected dose
+# (raw_norm k=2, depth 0.61) as the dense _k2 rungs — the point is to show the
+# repeng control is live on the EXPERTS, not just the dense residual. NOT in
+# QWEN_LADDER, so it needs its own explicit PRECISION_MAP + RUNG_GPU_HOURS entry
+# (default float32 would break the fp16 contract; a missing hours est projects $0
+# and skips the cost-guard projection). Same generate-on-Modal / judge-locally
+# split as the other _k2 rungs. SEPARATE _k2 paths; HARD $3 cap.
+MOE_MODEL_K2 = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
+MOE_K2_RECORDS = f"{_RESULTS_DIR}/records_moe_k2.jsonl"
+MOE_K2_TRIALS = f"{_RESULTS_DIR}/trials_moe_k2.jsonl"
+MOE_K2_CAP_USD = 3.0
+MOE_K2_RUNG_HOURS = {MOE_MODEL_K2: 0.5}  # biased-high; ~2.7B active projects $2.0 < $3
+
 # Per-model precision (SHARED CONTRACT). <=32B -> fp16; 72B anchor -> bf16 + nf4.
 PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     **{m: ("float16", None) for m in QWEN_LADDER + LLAMA_LADDER},
@@ -224,6 +238,7 @@ PRECISION_MAP: dict[str, tuple[str, str | None]] = {
     BASE_MODEL_K2: ("float16", None),  # 32B base, same fp16 contract as the Coder rung
     # Small-model _k2 rungs: NOT in QWEN_LADDER -> explicit fp16 (default float32 breaks fp16).
     **{m: ("float16", None) for m in RUNG_K2_MODELS},
+    MOE_MODEL_K2: ("float16", None),  # MoE probe, same fp16 contract (default would be float32)
     HELD_ANCHOR_72B: ("bfloat16", "nf4"),
 }
 
@@ -259,6 +274,10 @@ RUNG_GPU_HOURS: dict[str, float] = {
     RUNG_K2_BASE_14B: 0.7,
     RUNG_K2_CODER_7B: 0.4,
     RUNG_K2_CODER_14B: 0.7,
+    # MoE probe (~2.7B active): generate-only single rung. Biased-high 0.5h projects
+    # $2.0 < the $3 cap so the guard STARTS the rung; a missing entry would default
+    # to 0.0 and skip the projection.
+    MOE_MODEL_K2: 0.5,
 }
 
 # 72B anchor records go to a SEPARATE volume path — write_records opens mode 'w'
@@ -781,6 +800,194 @@ def run_base_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> di
     }
 
 
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=1800,  # two single forward passes; 30 min bounds cost well under the $3 cap
+)
+def run_moe_fitcheck(model_id: str = MOE_MODEL_K2) -> dict[str, object]:
+    """STEP 1 (issue #39): is the repeng control live on the EXPERTS of an MoE?
+
+    Loads ``model_id`` (Qwen1.5-MoE-A2.7B-Chat) fp16 at the corrected dose
+    (raw_norm, k=2, depth 0.61) and reports TWO things on the introspection prompt:
+
+    1. ``verify_injection_delta`` — magnitude_ratio + cosine, i.e. repeng's residual
+       arithmetic is live. NECESSARY but architecture-agnostic: it says nothing
+       MoE-specific.
+    2. ``router_shift`` — the EXPERT-ROUTING DIFF (control OFF vs ON): the fraction
+       of (MoE-layer, token) top-k expert SETS that move, and the mean L1 shift in
+       the gate softmax, for every MoE layer at/after the injection site. NONZERO
+       => injection re-routes which experts fire => the control reaches the MoE
+       machinery, not just the dense residual. This is what earns STEP 1.
+
+    Two-phase load (extract -> free -> generator) so only one copy is resident.
+    """
+    import gc
+
+    import torch
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.harness import RepengGenerator, layer_for_fraction
+    from introspection_scaling.runner import _load_causal_lm
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    try:
+        emodel, etok = _load_causal_lm(model_id, "cuda", "float16", None)
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        cv = extract_concept_vector(model_id, "oceans", model=emodel, tokenizer=etok, device="cuda")
+        del emodel, etok
+        _free()
+        if layer not in cv.raw_norms:
+            raise RuntimeError(f"raw_norms missing injection layer {layer}")
+        raw_norm = float(cv.raw_norms[layer])
+        alpha = 2.0 * raw_norm  # raw_norm dose, k=2 (same corrected dose as the _k2 rungs)
+        gen = RepengGenerator(
+            model_id, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        )
+        delta = {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+        routing = {k: float(v) for k, v in gen.router_shift(cv, layer, alpha).items()}
+        del gen, cv
+        _free()
+    except Exception as exc:  # noqa: BLE001 - report the probe failure, run nothing
+        return {"fit_ok": False, "model_id": model_id, "error": f"{type(exc).__name__}: {exc}"}
+
+    print(
+        f"[moe-fitcheck] layer={layer} raw_norm={raw_norm:.3f} alpha={alpha:.3f} "
+        f"ratio={delta['magnitude_ratio']:.3f} cos={delta['cosine_to_v_unit']:.3f} "
+        f"routing_changed_frac={routing['routing_changed_frac']:.3f} "
+        f"gate_l1_shift={routing['gate_l1_shift']:.4f} "
+        f"n_moe_positions={routing['n_moe_positions']:.0f}"
+    )
+    return {
+        "fit_ok": True,
+        "model_id": model_id,
+        "layer": layer,
+        "raw_norm": round(raw_norm, 3),
+        "k": 2.0,
+        "alpha": round(alpha, 3),
+        "verify_injection_delta": {k: round(v, 4) for k, v in delta.items()},
+        "router_shift": {k: round(v, 4) for k, v in routing.items()},
+        "note": "nonzero router_shift => injection perturbs expert routing (live on the experts)",
+    }
+
+
+@app.function(
+    image=_ladder_image,
+    gpu="A100-80GB",
+    volumes={_HF_CACHE_DIR: _hf_cache, _RESULTS_DIR: _results_vol},
+    secrets=[modal.Secret.from_name(HF_SECRET_NAME)],  # Qwen ungated; NO judge secret on Modal
+    timeout=2 * 3600,
+)
+def run_moe_k2(concepts: list[str], seeds: list[int], n_trials: int = 12) -> dict[str, object]:
+    """STEP 2 rung (issue #39): GENERATE-ONLY Qwen1.5-MoE-A2.7B-Chat transcripts at
+    the corrected paper dose (raw_norm, k=2) — an EXACT mirror of run_base_k2, so the
+    MoE sits on the same dose/protocol as the dense rungs. The authoritative judge is
+    the LOCAL Bedrock judge (AWS SSO is local); the RuleBasedJudge here is a
+    NON-authoritative placeholder so the transcripts persist. Committed result =
+    local Bedrock re-judge of these transcripts.
+
+    Fit-check first: log the ACTUAL alpha (= k·‖raw diff-of-means‖ at the 0.61
+    layer) and one ``verify_injection_delta`` so the dose is observably LIVE (not a
+    no-op / coherence-destroyer) — observe, do NOT tune. $3 cap; separate _k2 path.
+    """
+    import gc
+
+    import torch
+
+    from introspection_scaling import extract_concept_vector
+    from introspection_scaling.harness import RepengGenerator, RuleBasedJudge, layer_for_fraction
+    from introspection_scaling.runner import _load_causal_lm
+    from introspection_scaling.runner import run_ladder as _run
+
+    os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
+    if os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    # --- FIT CHECK + DOSE OBSERVABILITY (observe, never tune) ---
+    # ONE model resident at a time: Phase 1 extract -> free -> Phase 2 generator.
+    def _free() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    try:
+        emodel, etok = _load_causal_lm(MOE_MODEL_K2, "cuda", "float16", None)
+        layer = layer_for_fraction(int(emodel.config.num_hidden_layers))  # depth 0.61
+        cv = extract_concept_vector(
+            MOE_MODEL_K2, "oceans", model=emodel, tokenizer=etok, device="cuda"
+        )
+        del emodel, etok
+        _free()
+        if layer not in cv.raw_norms:
+            raise RuntimeError(f"raw_norms missing injection layer {layer}")
+        raw_norm = float(cv.raw_norms[layer])
+        alpha = CODER_K2_STRENGTH_K * raw_norm
+        gen = RepengGenerator(
+            MOE_MODEL_K2, device="cuda", dtype="float16", quant=None, max_new_tokens=8
+        )
+        diag = {k: float(v) for k, v in gen.verify_injection_delta(cv, layer, alpha).items()}
+        del gen, cv
+        _free()
+    except Exception as exc:  # noqa: BLE001 - report the fit/dose failure, run no sweep
+        return {
+            "fit_ok": False,
+            "model_id": MOE_MODEL_K2,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    print(
+        f"[dose] layer={layer} raw_norm={raw_norm:.3f} k={CODER_K2_STRENGTH_K} alpha={alpha:.3f} "
+        f"ratio={diag['magnitude_ratio']:.3f} cos={diag['cosine_to_v_unit']:.3f}"
+    )
+
+    # --- Generate (RuleBasedJudge PLACEHOLDER; transcripts are the payload) ---
+    result = _run(
+        [MOE_MODEL_K2],
+        concepts=concepts,
+        seeds=seeds,
+        n_trials=n_trials,
+        out_path=MOE_K2_RECORDS,
+        trials_path=MOE_K2_TRIALS,
+        depth_fraction=0.61,
+        dose_mode="raw_norm",
+        strength_k=CODER_K2_STRENGTH_K,
+        device="cuda",
+        precision_map=PRECISION_MAP,
+        judge=RuleBasedJudge(),  # NON-authoritative; real verdict = local Bedrock re-judge
+        cost_rate_per_hour=A100_80GB_USD_PER_HOUR,
+        cost_cap_usd=MOE_K2_CAP_USD,
+        rung_gpu_hours=MOE_K2_RUNG_HOURS,
+        on_model_done=_results_vol.commit,
+    )
+    _results_vol.commit()
+    _hf_cache.commit()
+    return {
+        "fit_ok": True,
+        "dose": {
+            "layer": layer,
+            "raw_norm": round(raw_norm, 3),
+            "k": CODER_K2_STRENGTH_K,
+            "alpha": round(alpha, 3),
+            **{k: round(v, 3) for k, v in diag.items()},
+        },
+        "trials_out": MOE_K2_TRIALS,
+        "n_trials_persisted": len(result.records),
+        "ran": result.ran,
+        "stopped_reason": result.stopped_reason,
+        "spent_usd_gpu": round(result.spent_usd, 2),
+        "note": "Modal verdicts are placeholders; authoritative = local Bedrock re-judge",
+    }
+
+
 def _run_rung_k2(
     model_id: str,
     records_path: str,
@@ -1077,6 +1284,27 @@ def base_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
     concepts = list(CONCEPT_WORDS[:n_concepts])
     result = run_base_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
     print("base_k2:", result)
+
+
+@app.local_entrypoint()
+def moe_fitcheck(model_id: str = MOE_MODEL_K2) -> None:
+    """`modal run modal_app.py::moe_fitcheck` — STEP 1 (issue #39): prove the repeng
+    control is live on the EXPERTS of Qwen1.5-MoE-A2.7B-Chat (magnitude_ratio +
+    expert-routing diff). No sweep, no judge; ~$2 GPU bound by the 30-min timeout."""
+    result = run_moe_fitcheck.remote(model_id)
+    print("moe_fitcheck:", result)
+
+
+@app.local_entrypoint()
+def moe_k2(n_concepts: int = 6, n_trials: int = 12) -> None:
+    """`modal run modal_app.py::moe_k2` — STEP 2 (issue #39): generate Qwen1.5-MoE
+    transcripts (raw_norm k=2, $3 cap). Judge LOCALLY with Bedrock afterwards
+    (scripts/rung_k2_judge.py results/trials_moe_k2.jsonl)."""
+    from introspection_scaling.extract import CONCEPT_WORDS
+
+    concepts = list(CONCEPT_WORDS[:n_concepts])
+    result = run_moe_k2.remote(concepts, [0, 1, 2], n_trials=n_trials)
+    print("moe_k2:", result)
 
 
 @app.local_entrypoint()

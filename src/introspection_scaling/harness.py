@@ -1307,3 +1307,84 @@ class RepengGenerator:
             "magnitude_ratio": delta_norm / (abs(alpha) + 1e-12),
             "cosine_to_v_unit": cos,
         }
+
+    def router_shift(self, inject: ConceptVectorLike, layer: int, alpha: float) -> dict[str, float]:
+        """Expert-routing perturbation from injecting ``inject`` at ``layer`` (MoE).
+
+        ``magnitude_ratio`` (``verify_injection_delta``) proves the residual moved
+        by the right amount, but it is architecture-agnostic — it says nothing
+        MoE-specific. This does: it forwards the introspection prompt through the
+        ``ControlModel`` with ``output_router_logits=True``, control OFF then ON
+        (``set_control`` at ``layer`` with ``alpha``), and measures how the
+        per-token expert routing changes for every MoE layer AT or AFTER the
+        injection site (a downstream MoE block cannot re-route on a residual the
+        injection never reached). Router logits map to decoder layers by INDEX —
+        HF's Qwen2Moe emits one ``router_logits`` entry per layer (``None`` for
+        any dense layer), so entry ``i`` is layer ``i``; ``None`` and pre-injection
+        entries are dropped.
+
+        Returns:
+        * ``routing_changed_frac`` — fraction of (MoE-layer, token) positions whose
+          top-k expert SET (``k = num_experts_per_tok``) differs OFF->ON.
+        * ``gate_l1_shift`` — mean L1 change in the full gate softmax distribution
+          over experts, per (MoE-layer, token) position.
+        * ``n_moe_positions`` — the denominator, for transparency.
+
+        NONZERO => injection perturbs which experts fire => the control is live on
+        the experts. Raises if the model emits no ``router_logits`` (i.e. dense).
+        """
+        import torch
+
+        v_unit = _assert_injectable(inject, layer)
+        cfg = self._model.config
+        top_k = int(getattr(cfg, "num_experts_per_tok", 0))
+        if top_k <= 0:
+            raise RuntimeError("model is not MoE (config has no num_experts_per_tok)")
+
+        enc = self.tokenizer(render_prompt(self.tokenizer), return_tensors="pt").to(self.device)
+
+        def _router_logits() -> list[Any]:
+            with torch.no_grad():
+                out = self._model(**enc, output_router_logits=True)
+            rl = getattr(out, "router_logits", None)
+            if not rl:
+                raise RuntimeError("model returned no router_logits (not MoE / flag unsupported)")
+            return list(rl)
+
+        self._model.reset()
+        off = _router_logits()
+        self._model.set_control(self._control_vector(v_unit, layer), alpha)
+        try:
+            on = _router_logits()
+        finally:
+            self._model.reset()
+
+        # Index == decoder layer (None-padded dense layers dropped); keep >= layer.
+        paired = [
+            (a, b)
+            for i, (a, b) in enumerate(zip(off, on, strict=False))
+            if a is not None and b is not None and i >= layer
+        ]
+        if not paired:
+            return {"routing_changed_frac": 0.0, "gate_l1_shift": 0.0, "n_moe_positions": 0.0}
+
+        changed = 0
+        total = 0
+        l1_sum = 0.0
+        for a, b in paired:
+            # (tokens, num_experts) gate logits -> full softmax distribution (fp32).
+            pa = torch.softmax(a.to(torch.float32), dim=-1)
+            pb = torch.softmax(b.to(torch.float32), dim=-1)
+            # top-k expert SET per token: sorted top-k index vectors are equal iff
+            # the selected expert sets are equal.
+            ta = pa.topk(top_k, dim=-1).indices.sort(dim=-1).values
+            tb = pb.topk(top_k, dim=-1).indices.sort(dim=-1).values
+            diff = (ta != tb).any(dim=-1)  # (tokens,) bool: did the top-k set move?
+            changed += int(diff.sum().item())
+            total += int(diff.numel())
+            l1_sum += float((pb - pa).abs().sum(dim=-1).sum().item())
+        return {
+            "routing_changed_frac": changed / total,
+            "gate_l1_shift": l1_sum / total,
+            "n_moe_positions": float(total),
+        }
