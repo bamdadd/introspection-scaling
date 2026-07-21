@@ -35,6 +35,7 @@ from introspection_scaling.harness import (
     layer_for_fraction,
     make_judge,
     render_prompt,
+    resolve_dose,
     run_concept,
     run_conditions,
     to_seed_records,
@@ -894,3 +895,36 @@ def test_dose_mode_unknown_raises():
             dose_mode="bogus",
             random_matched_fn=fake_random_matched,
         )
+
+
+def test_resolve_dose_raw_norm_uses_k_times_raw_norm():
+    # raw_norm mode: alpha = strength_k * cv.raw_norms[layer]; resid ignored.
+    cv = make_cv(layer=4)  # raw_norms[4] = 3.0
+    gen = BatchGenerator(concept=cv.concept, n_layers=8, resid_norm=999.0)
+    alpha, resid_norm = resolve_dose(cv, gen, 4, dose_mode="raw_norm", strength_k=2.0)
+    assert alpha == pytest.approx(2.0 * 3.0)
+    assert resid_norm is None
+
+
+def test_resolve_dose_resid_frac_uses_fraction_times_measured_resid():
+    cv = make_cv(layer=4)
+    gen = BatchGenerator(concept=cv.concept, n_layers=8, resid_norm=100.0)
+    alpha, resid_norm = resolve_dose(
+        cv, gen, 4, dose_mode="resid_frac", dose_fraction=0.044
+    )
+    assert alpha == pytest.approx(0.044 * 100.0)
+    assert resid_norm == pytest.approx(100.0)
+
+
+def test_resolve_dose_missing_raw_norm_layer_raises_keyerror():
+    cv = make_cv(layer=4)  # only layer 4 has a raw norm
+    gen = BatchGenerator(concept=cv.concept, n_layers=8)
+    with pytest.raises(KeyError):
+        resolve_dose(cv, gen, 7, dose_mode="raw_norm")
+
+
+def test_resolve_dose_unknown_mode_raises_valueerror():
+    cv = make_cv(layer=4)
+    gen = BatchGenerator(concept=cv.concept, n_layers=8)
+    with pytest.raises(ValueError, match="unknown dose_mode"):
+        resolve_dose(cv, gen, 4, dose_mode="bogus")
