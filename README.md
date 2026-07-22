@@ -55,7 +55,7 @@ cv    = extract_concept_vector(MODEL, "oceans", device="cpu")  # repeng diff-of-
 gen   = RepengGenerator(MODEL, device="cpu")                   # injects h += α·v_unit via ControlModel
 judge = AnthropicJudge()                                       # scores the self-report (needs API key)
 
-records = run_concept(                                         # inject @0.61 depth, α = 0.044·‖resid‖
+records = run_concept(                                         # inject @0.61 depth, α = 2·‖raw diff-of-means‖
     cv, generator=gen, judge=judge, seeds=(0, 1, 2),
     random_matched_fn=make_random_matched,                     # random-matched-norm control
 )
@@ -69,7 +69,7 @@ To use a recovered or custom baseline appendix, pass `--baseline-file path/to/wo
 ```mermaid
 flowchart LR
   W["50 concept words<br/>vs baseline"] --> E["repeng<br/>diff-of-means"] --> CV["ConceptVector<br/>unit-L2 per layer"]
-  CV --> INJ["inject @0.61 depth<br/>α = 0.044·‖resid‖"]
+  CV --> INJ["inject @0.61 depth<br/>α = 2·‖raw diff-of-means‖"]
   P["introspection prompt<br/>native chat template"] --> INJ
   INJ --> GEN["generate<br/>Qwen2.5 + Llama-3.x ladders"] --> J["Anthropic judge<br/>coherent AND correct-ID"] --> R["detection rate<br/>vs parameter count"]
   CTRL["controls:<br/>no-injection ·<br/>random-matched norm"] --> INJ
@@ -121,11 +121,18 @@ of matched norm, reported beside every result.
 
 ### Injection depth & strength
 We normalize each per-layer direction to unit L2 and inject `h ← h + α·v_unit`.
-**Strength is norm-relative:** `α = 0.044 · ‖resid‖`, where `‖resid‖` is the
-residual-stream L2 norm measured at the injection block for *that* model — raw α
-does not transfer across sizes (residual norm scales with architecture). We
-target a fraction of ~0.044 and hard-cap it below 0.09 (a coherence cliff, where
-over-steering degrades and can reverse the effect).
+**Strength is the paper's canonical value:** `α = 2 · ‖raw diff-of-means‖`, the L2
+norm of the concept's raw diff-of-means at the injection layer for *that* model
+(`dose_mode="raw_norm"`, the default). This is the corrected, published regime —
+the diagnosis showed the earlier residual-relative dose was ~4–16× too weak.
+
+*Superseded:* the original run used a norm-relative `α = 0.044 · ‖resid‖` (a
+fraction of the residual-stream L2 norm, hard-capped below 0.09 at a coherence
+cliff where over-steering degrades and can reverse the effect). Raw α does not
+transfer across sizes, which motivated the fraction; the correction instead ties
+α to the raw diff-of-means norm. That under-dosed regime is retained only as an
+explicit `dose_mode="resid_frac"` option, not the default — see the
+[superseded appendix](RESULTS.md#superseded-original-under-dosed-run).
 **Depth = 0.61 fraction-of-depth** (`layer = round(0.61·N)`), the default.
 Now reproduced in-repo — the depth and dose defaults come from our companion
 steering-dose study ([steerbench], a separate repo; see Methods), and its numbers
