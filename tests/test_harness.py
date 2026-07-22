@@ -909,9 +909,7 @@ def test_resolve_dose_raw_norm_uses_k_times_raw_norm():
 def test_resolve_dose_resid_frac_uses_fraction_times_measured_resid():
     cv = make_cv(layer=4)
     gen = BatchGenerator(concept=cv.concept, n_layers=8, resid_norm=100.0)
-    alpha, resid_norm = resolve_dose(
-        cv, gen, 4, dose_mode="resid_frac", dose_fraction=0.044
-    )
+    alpha, resid_norm = resolve_dose(cv, gen, 4, dose_mode="resid_frac", dose_fraction=0.044)
     assert alpha == pytest.approx(0.044 * 100.0)
     assert resid_norm == pytest.approx(100.0)
 
