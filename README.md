@@ -63,6 +63,20 @@ for r in aggregate(records):                                   # detection rate 
     print(r.condition, r.successes, "/", r.n)
 ```
 
+**No API key? Run it key-free (non-faithful smoke path).** For a local run on CPU
+without an API key, swap in the shipped keyword judge:
+
+```python
+from introspection_scaling import RuleBasedJudge
+judge = RuleBasedJudge()   # key-free, runs offline — see the caveat below
+```
+
+or pass `--allow-rule-based-judge` to the runner. `RuleBasedJudge` is a keyword
+heuristic, **not** a faithful reproduction of the paper's open-ended grader — it
+exists only to exercise the pipeline end-to-end for smoke runs / CI, and its
+verdicts must **not** be used for reported results. Use `AnthropicJudge` (or
+`BedrockJudge`) for anything you report.
+
 To use a recovered or custom baseline appendix, pass `--baseline-file path/to/words.txt` to the runner; it accepts one word per line and ignores blanks, comments, and repeated words.
 
 ## Architecture
