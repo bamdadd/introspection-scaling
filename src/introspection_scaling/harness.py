@@ -1074,6 +1074,30 @@ def _build_quant_config(quant: str | None, compute_dtype: Any) -> Any:
     )
 
 
+def resolve_inject_span_start(tokenizer: Any, prompt: str, inject_span: str) -> int:
+    """Token index where injection begins for ``inject_span`` on ``prompt``.
+
+    ``"full"`` injects from the start of the prompt (token 0) — the A2 task
+    default. ``"trial"`` is the paper's stricter span: injection begins at the
+    newline immediately before ``"Trial 1"``, so the preamble that sets up the
+    protocol is excluded and only the trial question onward (prompt tail +
+    generated response) is injected.
+    """
+    if inject_span == "full":
+        return 0
+    if inject_span != "trial":
+        raise NotImplementedError(
+            f"inject_span={inject_span!r} is not implemented; supported: 'full', 'trial'"
+        )
+    trial_idx = prompt.index("Trial 1")
+    nl_idx = prompt.rindex("\n", 0, trial_idx)
+    offsets = tokenizer(prompt, return_offsets_mapping=True)["offset_mapping"]
+    for token_idx, (start, end) in enumerate(offsets):
+        if start <= nl_idx < end:
+            return token_idx
+    raise ValueError("could not locate the 'Trial 1' anchor newline in the tokenized prompt")
+
+
 class RepengGenerator:
     """Injects a concept vector via repeng ``ControlModel`` and samples a reply.
 
@@ -1085,8 +1109,8 @@ class RepengGenerator:
 
     ``inject_span`` is configurable. Default ``"full"`` injects across the whole
     forward pass (prompt + response) per the A2 task ("from the prompt through
-    the response"); the paper's stricter span begins at the newline before
-    "Trial 1". Noted divergence, non-blocking for dev.
+    the response"); ``"trial"`` is the paper's stricter span, beginning at the
+    newline before "Trial 1" (see ``resolve_inject_span_start``).
     """
 
     def __init__(
@@ -1121,10 +1145,9 @@ class RepengGenerator:
         self.quant = quant
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
-        if inject_span != "full":
+        if inject_span not in ("full", "trial"):
             raise NotImplementedError(
-                "only inject_span='full' is implemented for dev; the paper's "
-                "trial-scoped span is a downstream refinement."
+                f"inject_span={inject_span!r} is not implemented; supported: 'full', 'trial'"
             )
         self.inject_span = inject_span
 
@@ -1210,38 +1233,72 @@ class RepengGenerator:
         Injection is identical across the batch (same condition/seed), so a single
         ``set_control`` covers all ``n``. Sampling stays temperature-1 with
         ``top_p=1, top_k=0``; the batch is reproducible given ``seed``.
+
+        ``inject_span="trial"`` forwards the pre-anchor preamble with control OFF
+        (just to build its KV cache) and only turns control on for the
+        anchor-onward continuation — repeng's ``set_control`` has no notion of a
+        per-token span, so splitting the forward pass at the cache boundary is
+        the only way to keep the preamble un-injected while still generating
+        through the same cached ``generate()`` call as "full".
         """
         if n < 1:
             raise ValueError(f"n must be >= 1, got {n}")
         torch = self._torch
         self._model.reset()
+        control_vector = None
         if inject is not None:
             v_unit = _assert_injectable(inject, layer)
-            self._model.set_control(self._control_vector(v_unit, layer), alpha)
+            control_vector = self._control_vector(v_unit, layer)
         try:
             prompt = render_prompt(self.tokenizer)
             enc = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-            torch.manual_seed(seed)
-            out = self._model.generate(
-                **enc,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=self.temperature,
+            span_start = resolve_inject_span_start(self.tokenizer, prompt, self.inject_span)
+            gen_kwargs: dict[str, Any] = {
+                "max_new_tokens": self.max_new_tokens,
+                "do_sample": True,
+                "temperature": self.temperature,
                 # Pin PURE temperature sampling: many ladder models ship a
                 # truncating top_p/top_k in generation_config.json, which would
                 # make the rate a truncated-temperature measurement, not the
                 # temperature-1 the SPEC requires. Override explicitly.
-                top_p=1.0,
-                top_k=0,
-                num_return_sequences=n,
+                "top_p": 1.0,
+                "top_k": 0,
                 # KV-cache ON: without it repeng's per-layer forwards reprocess the
                 # whole sequence every step (O(n^2)) -> the 200-token hang.
-                use_cache=self.use_cache,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-            plen = enc["input_ids"].shape[1]
+                "use_cache": self.use_cache,
+                "pad_token_id": self.tokenizer.pad_token_id,
+            }
+            if span_start == 0:
+                if control_vector is not None:
+                    self._model.set_control(control_vector, alpha)
+                torch.manual_seed(seed)
+                out = self._model.generate(**enc, num_return_sequences=n, **gen_kwargs)
+                completion_start = enc["input_ids"].shape[1]
+            else:
+                # Preamble (control OFF) builds the KV cache; only the
+                # anchor-onward span is generated with control ON.
+                preamble_ids = enc["input_ids"][:, :span_start]
+                preamble_mask = enc["attention_mask"][:, :span_start]
+                span_ids = enc["input_ids"][:, span_start:]
+                with torch.no_grad():
+                    preamble_out = self._model(
+                        input_ids=preamble_ids, attention_mask=preamble_mask, use_cache=True
+                    )
+                past = preamble_out.past_key_values
+                past.batch_repeat_interleave(n)
+                if control_vector is not None:
+                    self._model.set_control(control_vector, alpha)
+                torch.manual_seed(seed)
+                out = self._model.generate(
+                    input_ids=span_ids.repeat(n, 1),
+                    attention_mask=enc["attention_mask"].repeat(n, 1),
+                    past_key_values=past,
+                    **gen_kwargs,
+                )
+                completion_start = span_ids.shape[1]
             texts = [
-                self.tokenizer.decode(out[i, plen:], skip_special_tokens=True) for i in range(n)
+                self.tokenizer.decode(out[i, completion_start:], skip_special_tokens=True)
+                for i in range(n)
             ]
         finally:
             self._model.reset()
