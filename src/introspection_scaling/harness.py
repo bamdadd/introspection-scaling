@@ -1074,6 +1074,36 @@ def _build_quant_config(quant: str | None, compute_dtype: Any) -> Any:
     )
 
 
+def layer_logit_lens(
+    hidden_states: Sequence[Any],
+    final_norm: Callable[[Any], Any],
+    lm_head: Callable[[Any], Any],
+    concept_token_id: int,
+) -> list[dict[str, float]]:
+    """Logit-lens the last-token residual at EVERY layer: project it through
+    the model's own readout (final norm + unembedding) and report where
+    ``concept_token_id`` ranks in the resulting next-token distribution.
+
+    Generalises RESULTS.md's single-point logit-lens finding ("is the
+    injected concept linearly decodable at the readout?") across depth.
+    Forward-pass only — no generation, no sampling.
+
+    ``hidden_states`` is ``output_hidden_states`` from a forward pass: entry 0
+    is the embedding output, entry ``i`` (``i`` >= 1) is the output of block
+    ``i - 1``. ``rank`` is 0-indexed (0 == top of the vocabulary, i.e. maximally
+    legible); it counts logits strictly greater than the concept token's.
+    """
+    records: list[dict[str, float]] = []
+    for layer_idx, hs in enumerate(hidden_states):
+        logits = lm_head(final_norm(hs[:, -1, :]))[0]
+        concept_logit = logits[concept_token_id]
+        rank = int((logits > concept_logit).sum().item())
+        records.append(
+            {"layer": float(layer_idx), "rank": float(rank), "logit": float(concept_logit.item())}
+        )
+    return records
+
+
 class RepengGenerator:
     """Injects a concept vector via repeng ``ControlModel`` and samples a reply.
 
@@ -1388,3 +1418,50 @@ class RepengGenerator:
             "gate_l1_shift": l1_sum / total,
             "n_moe_positions": float(total),
         }
+
+    def logit_lens_layer_sweep(
+        self, inject: ConceptVectorLike, layer: int, alpha: float, concept_token_id: int
+    ) -> list[dict[str, float]]:
+        """Sweep every layer, OFF vs ON, and report where ``concept_token_id``
+        ranks in the model's own next-token distribution (issue #32).
+
+        Forward-pass only (no generation, no judge) — cheap enough to run
+        alongside the injection itself. Wraps ``layer_logit_lens`` with this
+        model's readout (final norm + unembedding) and the introspection
+        prompt's last-token residual, once per condition.
+
+        Returns one record per ``output_hidden_states`` entry:
+        ``rank_baseline``/``rank_injected`` (0 == top of the vocabulary, i.e.
+        maximally legible) and ``logit_lift`` (injected minus baseline logit
+        for ``concept_token_id`` — positive means injection made the concept
+        more legible at that layer).
+        """
+        torch = self._torch
+        v_unit = _assert_injectable(inject, layer)
+        base = self._model.model
+        final_norm = base.model.norm
+        lm_head = base.lm_head
+        enc = self.tokenizer(render_prompt(self.tokenizer), return_tensors="pt").to(self.device)
+
+        def _hidden_states() -> Sequence[Any]:
+            with torch.no_grad():
+                out = self._model(**enc, output_hidden_states=True)
+            return cast(Sequence[Any], out.hidden_states)
+
+        self._model.reset()
+        baseline = layer_logit_lens(_hidden_states(), final_norm, lm_head, concept_token_id)
+        self._model.set_control(self._control_vector(v_unit, layer), alpha)
+        try:
+            injected = layer_logit_lens(_hidden_states(), final_norm, lm_head, concept_token_id)
+        finally:
+            self._model.reset()
+
+        return [
+            {
+                "layer": b["layer"],
+                "rank_baseline": b["rank"],
+                "rank_injected": inj["rank"],
+                "logit_lift": inj["logit"] - b["logit"],
+            }
+            for b, inj in zip(baseline, injected, strict=True)
+        ]

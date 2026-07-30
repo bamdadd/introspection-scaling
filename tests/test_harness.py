@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
+import torch
 
 from introspection_scaling.harness import (
     DEFAULT_STRENGTH_K,
@@ -33,6 +34,7 @@ from introspection_scaling.harness import (
     generate_concept_completions,
     judge_completions,
     layer_for_fraction,
+    layer_logit_lens,
     make_judge,
     render_prompt,
     resolve_dose,
@@ -172,6 +174,30 @@ def test_render_prompt_uses_chat_template_for_instruct():
 
 def test_render_prompt_falls_back_without_template():
     assert render_prompt(_NoChatTok()) == build_prompt()
+
+
+def test_layer_logit_lens_reports_rank_and_logit_per_layer():
+    """Two tiny layers, hand-picked so the concept token's rank visibly drops
+    (2 -> 0) and its logit visibly rises (0.0 -> 5.0) between them — the same
+    shape of effect RESULTS.md reports at a single layer, generalised here to
+    a sweep. ``final_norm`` is the identity so the expected numbers are exact.
+    """
+    hidden_states = [
+        torch.tensor([[[9.0, 9.0], [1.0, 0.0]]]),  # layer 0 last token: [1, 0]
+        torch.tensor([[[9.0, 9.0], [0.0, 5.0]]]),  # layer 1 last token: [0, 5]
+    ]
+    # vocab=3, hidden=2: logits = [h0, h1, h0+h1]
+    weight = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+
+    records = layer_logit_lens(
+        hidden_states,
+        final_norm=lambda h: h,
+        lm_head=lambda h: h @ weight.T,
+        concept_token_id=1,
+    )
+
+    assert records[0] == {"layer": 0.0, "rank": 2.0, "logit": 0.0}
+    assert records[1] == {"layer": 1.0, "rank": 0.0, "logit": 5.0}
 
 
 def test_layer_for_fraction():
