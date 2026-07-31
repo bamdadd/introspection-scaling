@@ -1,0 +1,158 @@
+{
+  "model_id": "Qwen/Qwen2.5-0.5B",
+  "concept": "Oceans",
+  "layer": 15,
+  "alpha": 9.854211807250977,
+  "records": [
+    {
+      "layer": 0.0,
+      "rank_baseline": 176.0,
+      "rank_injected": 176.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 1.0,
+      "rank_baseline": 66709.0,
+      "rank_injected": 66709.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 2.0,
+      "rank_baseline": 136020.0,
+      "rank_injected": 136020.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 3.0,
+      "rank_baseline": 122576.0,
+      "rank_injected": 122576.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 4.0,
+      "rank_baseline": 126819.0,
+      "rank_injected": 126819.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 5.0,
+      "rank_baseline": 80963.0,
+      "rank_injected": 80963.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 6.0,
+      "rank_baseline": 135783.0,
+      "rank_injected": 135783.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 7.0,
+      "rank_baseline": 119798.0,
+      "rank_injected": 119798.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 8.0,
+      "rank_baseline": 113005.0,
+      "rank_injected": 113005.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 9.0,
+      "rank_baseline": 133096.0,
+      "rank_injected": 133096.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 10.0,
+      "rank_baseline": 143481.0,
+      "rank_injected": 143481.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 11.0,
+      "rank_baseline": 135228.0,
+      "rank_injected": 135228.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 12.0,
+      "rank_baseline": 107560.0,
+      "rank_injected": 107560.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 13.0,
+      "rank_baseline": 131358.0,
+      "rank_injected": 131358.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 14.0,
+      "rank_baseline": 147514.0,
+      "rank_injected": 147514.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 15.0,
+      "rank_baseline": 146933.0,
+      "rank_injected": 146933.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 16.0,
+      "rank_baseline": 146516.0,
+      "rank_injected": 146516.0,
+      "logit_lift": 0.0
+    },
+    {
+      "layer": 17.0,
+      "rank_baseline": 146066.0,
+      "rank_injected": 148163.0,
+      "logit_lift": -0.7800977230072021
+    },
+    {
+      "layer": 18.0,
+      "rank_baseline": 143352.0,
+      "rank_injected": 147015.0,
+      "logit_lift": -0.943345308303833
+    },
+    {
+      "layer": 19.0,
+      "rank_baseline": 133216.0,
+      "rank_injected": 144638.0,
+      "logit_lift": -1.254626750946045
+    },
+    {
+      "layer": 20.0,
+      "rank_baseline": 103238.0,
+      "rank_injected": 132734.0,
+      "logit_lift": -1.3126664757728577
+    },
+    {
+      "layer": 21.0,
+      "rank_baseline": 67637.0,
+      "rank_injected": 108093.0,
+      "logit_lift": -1.2174524664878845
+    },
+    {
+      "layer": 22.0,
+      "rank_baseline": 12969.0,
+      "rank_injected": 47775.0,
+      "logit_lift": -1.1927528977394104
+    },
+    {
+      "layer": 23.0,
+      "rank_baseline": 48679.0,
+      "rank_injected": 45702.0,
+      "logit_lift": -0.08393412828445435
+    },
+    {
+      "layer": 24.0,
+      "rank_baseline": 32467.0,
+      "rank_injected": 55814.0,
+      "logit_lift": -2.2871439456939697
+    }
+  ]
+}

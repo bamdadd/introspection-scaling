@@ -208,6 +208,22 @@ concept token far up the model's own next-token ranking, while in Instruct-32B i
 as illegible as no injection. The dissociation is a legibility difference from
 post-training.](results/logit_lens_k2.png)
 
+**Layer sweep (dev model, not a replacement for the 32B finding above).** The 32B
+result above logit-lenses ONE residual point (the injection layer). `scripts/
+logit_lens_sweep.py` generalises this to every layer via `harness.layer_logit_lens` /
+`RepengGenerator.logit_lens_layer_sweep`, forward-pass-only and effectively free on
+CPU. Run on the 0.5B dev model (base vs instruct, concept "Oceans", corrected dose):
+injection lifts the concept's logit from layer 17 onward — the first layer where
+repeng's control is observable in `hidden_states` is `layer_id + 2`, matching the
+offset documented at the `verify_injection_delta` seam — but the rank barely moves (tens
+of thousands, both rungs), nowhere near the 32B result's ~4k. A NULL at this scale: at
+0.5B the injected concept isn't legible at the readout the way it is in Coder-32B.
+Consistent with either a scale threshold for legibility or this being too small/generic
+a probe (one concept, one seed) to draw a real conclusion — flagged here as a NULL, not
+smoothed over. Data: `results/logit_lens_sweep_{base,instruct}.json`. Reproduced on
+an Apple M4 Max CPU in 15.9 s wall-clock (forward-pass only, no GPU): one concept, one
+seed, an honest NULL.
+
 ## Method (corrected dose)
 
 - **Injection:** at depth ~0.61 (`layer = round(0.61·N_layers)`), strength
