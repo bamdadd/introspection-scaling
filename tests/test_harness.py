@@ -20,6 +20,7 @@ from introspection_scaling.harness import (
     Completion,
     Condition,
     JudgeVerdict,
+    RepengGenerator,
     RuleBasedJudge,
     TrialRecord,
     _build_quant_config,
@@ -36,6 +37,7 @@ from introspection_scaling.harness import (
     make_judge,
     render_prompt,
     resolve_dose,
+    resolve_inject_span_start,
     run_concept,
     run_conditions,
     to_seed_records,
@@ -172,6 +174,73 @@ def test_render_prompt_uses_chat_template_for_instruct():
 
 def test_render_prompt_falls_back_without_template():
     assert render_prompt(_NoChatTok()) == build_prompt()
+
+
+class _OffsetTok:
+    """Fixed offset-mapping stub — mimics a real BPE tokenizer merging the
+    trailing '.' and the newline before "Trial 1" into one token, as observed
+    on Qwen2.5-0.5B-Instruct's actual tokenizer."""
+
+    def __init__(self, offsets):
+        self._offsets = offsets
+
+    def __call__(self, text, return_offsets_mapping=False):  # noqa: ANN001, ARG002
+        assert return_offsets_mapping is True
+        return {"input_ids": list(range(len(self._offsets))), "offset_mapping": self._offsets}
+
+
+def test_resolve_inject_span_start_full_is_always_token_zero():
+    tok = _OffsetTok([(0, 3), (3, 7)])
+    assert resolve_inject_span_start(tok, "abcTrial 1", "full") == 0
+
+
+def test_resolve_inject_span_start_trial_lands_on_anchor_newline():
+    prompt = "started.\nTrial 1: rest"
+    nl_idx = prompt.index("\n")
+    tok = _OffsetTok([(0, 7), (7, 9), (9, 14), (14, 23)])  # ".\n" merged at index 1
+
+    idx = resolve_inject_span_start(tok, prompt, "trial")
+
+    assert idx == 1
+    start, end = tok(prompt, return_offsets_mapping=True)["offset_mapping"][idx]
+    assert start <= nl_idx < end
+    assert "\n" in prompt[start:end]
+
+
+def test_resolve_inject_span_start_rejects_unknown_span():
+    tok = _OffsetTok([(0, 1)])
+    with pytest.raises(NotImplementedError, match="unknown-span"):
+        resolve_inject_span_start(tok, "x", "unknown-span")
+
+
+def test_repeng_generator_rejects_unknown_inject_span():
+    # Guard fires before any tokenizer/model load, so no network/weights needed.
+    with pytest.raises(NotImplementedError, match="unknown-span"):
+        RepengGenerator("unused-model-id", inject_span="unknown-span")
+
+
+# --- real tokenizer: trial-span anchor (needs network, no model weights) --- #
+
+QWEN_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+@pytest.mark.slow
+def test_resolve_inject_span_start_trial_on_qwen_tokenizer():
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(QWEN_MODEL_ID)
+    prompt = render_prompt(tok)
+
+    idx = resolve_inject_span_start(tok, prompt, "trial")
+
+    offsets = tok(prompt, return_offsets_mapping=True)["offset_mapping"]
+    start, end = offsets[idx]
+    assert "\n" in prompt[start:end]
+    trial_idx = prompt.index("Trial 1")
+    nl_idx = prompt.rindex("\n", 0, trial_idx)
+    assert start <= nl_idx < end
+
+    assert resolve_inject_span_start(tok, prompt, "full") == 0
 
 
 def test_layer_for_fraction():
