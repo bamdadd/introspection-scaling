@@ -125,6 +125,36 @@ Coherence climbs with scale (0.5B is largely incoherent under the paper-strength
 the Instruct model is both coherent and frequently affirmative, yet still never
 correctly identifies the concept. Correct-identification is the wall.
 
+### Base-model rung: plumbing confirmed, confound illustrated (dev-model demo)
+
+README's confound discussion (base "failure" conflates *can't introspect* with
+*can't follow the prompt*) was previously asserted, not tested. `scripts/
+base_vs_instruct_probe.py` runs a base rung alongside instruct end to end
+(same concept, same dose recipe, 3 seeds, both controls) on the 0.5B dev model
+(Qwen2.5-0.5B base vs Qwen2.5-0.5B-Instruct) to exercise the plumbing: no new
+flag is needed (`render_prompt` already falls back to the raw
+Human:/Assistant: transcript when a tokenizer has no chat template), and the
+base/instruct label falls straight out of the HF model_id
+(`scripts/trend_table.py:parse_model_id`) with no `SeedRecord` schema change.
+
+This uses `RuleBasedJudge` (key-free smoke path) and one concept on the
+smallest dev model — **not a reportable detection rate**, just a demo that
+the rung runs and labels correctly. Both rungs come back 0/12 injected, which
+tells us nothing on its own (0.5B is already below the coherence floor per
+the section above). What IS informative: a sample injected-condition
+transcript from the base rung degrades into token salad —
+`'Recognizing the injected Thought "The Axioms of Logic!"\n nrw (133
+1.0467203243845655 e-45684568) NR > r (133 0.25078609472257987e-73)...'` —
+while the instruct rung on the identical prompt stays fluent English. That is
+the confound made concrete: the base model's null is at least partly *can't
+follow a multi-turn chat transcript*, not *can't introspect*. Confirming this
+at a scale where the effect is real (32B, with `AnthropicJudge`) is future
+work; this rung establishes that the tooling supports it without new plumbing
+and shows what a base rung's failure mode actually looks like. Data:
+`results/records_base_rung_demo.jsonl`. Run on an Apple M4 Max CPU in 167 s
+wall-clock (RuleBasedJudge smoke, forward+generate); all-zero NULL — reports
+nothing on its own.
+
 ### Cross-model dose-fragility: out-of-family broken-model nulls (DeepSeek-Coder-33B, CodeLlama-34B)
 
 Dose-fragility is not only about absolute strength — it is also model-specific. We ran
